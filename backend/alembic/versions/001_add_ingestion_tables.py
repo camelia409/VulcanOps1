@@ -20,6 +20,54 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     op.create_table(
+        "machines",
+        sa.Column(
+            "machine_id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            nullable=False,
+        ),
+        sa.Column("machine_name", sa.String(length=255), nullable=False),
+        sa.Column("machine_type", sa.String(length=100), nullable=False),
+        sa.Column("plant", sa.String(length=255), nullable=False),
+        sa.Column("location", sa.String(length=255), nullable=False),
+        sa.Column(
+            "criticality",
+            sa.Enum(
+                "low", "medium", "high", "critical",
+                name="machine_criticality",
+            ),
+            nullable=False,
+        ),
+        sa.Column(
+            "status",
+            sa.Enum(
+                "operational",
+                "degraded",
+                "under_maintenance",
+                "offline",
+                "decommissioned",
+                name="machine_status",
+            ),
+            server_default=sa.text("'operational'"),
+            nullable=False,
+        ),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.PrimaryKeyConstraint("machine_id"),
+    )
+
+    op.create_table(
         "ingestion_events",
         sa.Column(
             "event_id",
@@ -145,3 +193,6 @@ def downgrade() -> None:
     op.drop_table("stored_role_reports")
     op.drop_table("report_batches")
     op.drop_table("ingestion_events")
+    op.drop_table("machines")
+    op.execute("DROP TYPE IF EXISTS machine_criticality")
+    op.execute("DROP TYPE IF EXISTS machine_status")
