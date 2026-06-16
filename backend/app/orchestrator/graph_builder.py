@@ -26,24 +26,22 @@ _PIPELINE_LOG = logging.getLogger("vulcanops.pipeline")
 
 # ── uncertain-diagnosis text sanitizer ───────────────────────────────────────
 
-_FORBIDDEN_PATTERN = re.compile(
+# Only strip language that implies certainty when the diagnosis is uncertain.
+# Concrete maintenance terms (bearing wear, replace bearings, LOTO) are allowed
+# when evidence supports them; they are only suppressed for uncertain cases.
+_UNCERTAINTY_PATTERN = re.compile(
     r"confirmed\b|"
-    r"supported by available evidence|"
-    r"controlled shutdown|"
-    r"bearing wear|"
-    r"overheating due to friction|"
-    r"replace bearings|"
-    r"LOTO procedure|"
-    r"isolate the machine|"
-    r"cooling fluid replacement|"
-    r"thermal gasket replacement",
+    r"definitely\s+is\b|"
+    r"certainly\s+is\b|"
+    r"proven\s+to\s+be\b|"
+    r"supported by available evidence\b",
     re.IGNORECASE,
 )
 
 
 def _sanitize_uncertain_text(text: str) -> str:
-    """Replace confirmed-diagnosis phrasing that contradicts an uncertain diagnosis."""
-    return _FORBIDDEN_PATTERN.sub("[pending investigation]", text)
+    """Replace certainty-claim phrasing that contradicts an uncertain diagnosis."""
+    return _UNCERTAINTY_PATTERN.sub("[pending investigation]", text)
 
 from langgraph.graph import END, START, StateGraph
 
@@ -290,6 +288,9 @@ async def _evidence_verification_node(state: VulcanOpsState) -> dict:
         verified=d["verified"],
         verification_notes=d.get("verification_notes"),
         contradictions=d.get("warnings", []),
+        evidence_score=d.get("evidence_score", 0.0),
+        history_score=d.get("history_score", 0.0),
+        combined_score=d.get("combined_score", 0.0),
     )
     return {
         "verification": verification,
@@ -513,6 +514,54 @@ async def _communication_node(state: VulcanOpsState) -> dict:
     return updates
 
 
+# ── report quality matrix ─────────────────────────────────────────────────────
+
+class ReportQuality:
+    """Evidence- and confidence-aware classification for final report handling."""
+
+    # Evidence is considered weak if both documentary and historical corroboration
+    # are below this threshold. The verification agent uses 0.25; we align with it.
+    EVIDENCE_WEAK = 0.25
+
+    # Confidence bands. These are NOT hard cutoffs for suppressing content;
+    # they inform how aggressively we sanitize and what fallback prose to use.
+    LOW_CONFIDENCE = 0.50
+    MODERATE_CONFIDENCE = 0.70
+    HIGH_CONFIDENCE = 0.85
+
+
+class ReportDisposition:
+    SPECIFIC = "specific"
+    CAUTIOUS = "cautious"
+    FALLBACK = "fallback"
+
+
+def _classify_report(
+    confidence: float,
+    verified: bool | None,
+    evidence_score: float,
+    history_score: float,
+    has_evidence: bool,
+) -> tuple[str, str]:
+    """Return (disposition, reason) for the final report.
+
+    Matrix:
+      - strong evidence + high confidence   → specific diagnosis and action
+      - moderate evidence / moderate conf   → cautious diagnosis with partial recs
+      - weak evidence + low confidence      → manual-inspection fallback
+      - circuit breaker / API failure       → safe fallback (handled upstream)
+    """
+    if confidence >= ReportQuality.HIGH_CONFIDENCE and verified:
+        return ReportDisposition.SPECIFIC, "high_confidence_verified"
+    if confidence >= ReportQuality.MODERATE_CONFIDENCE and (verified or evidence_score >= ReportQuality.EVIDENCE_WEAK):
+        return ReportDisposition.SPECIFIC, "moderate_confidence_supported"
+    if confidence >= ReportQuality.LOW_CONFIDENCE and (verified or evidence_score >= ReportQuality.EVIDENCE_WEAK or history_score >= ReportQuality.EVIDENCE_WEAK):
+        return ReportDisposition.CAUTIOUS, "low_confidence_partial_evidence"
+    if has_evidence:
+        return ReportDisposition.CAUTIOUS, "evidence_present_but_weak"
+    return ReportDisposition.FALLBACK, "insufficient_evidence"
+
+
 # ── node: finalize — Invariants 4 & 5 ────────────────────────────────────────
 
 
@@ -544,24 +593,46 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
             "errors": errors,
         }
 
-    # ── GLOBAL UNCERTAINTY OVERRIDE ───────────────────────────────────────────
-    # Single source of truth. Runs after every agent has completed.
-    # Mutates state objects in-place then returns them as explicit state updates
-    # so report_builder.py reads corrected values without any uncertainty logic
-    # of its own. The sanitizer (_sanitize_uncertain_text) is also defined once,
-    # here, and applied nowhere else.
-    _confidence   = state.diagnosis.confidence or 0.0
-    _root_cause   = state.diagnosis.root_cause or ""
+    # ── EVIDENCE- AND CONFIDENCE-AWARE FINALIZATION ───────────────────────────
+    # Use the report-quality matrix to decide how much to sanitize vs. preserve.
+    # Verified diagnoses with moderate-or-better confidence keep their concrete
+    # content; weak/unverified cases get cautious or fallback treatment.
+    _confidence = state.diagnosis.confidence or 0.0
+    _root_cause = state.diagnosis.root_cause or ""
     _failure_mode = state.diagnosis.failure_mode or ""
-    diagnosis_uncertain = (
-        _confidence < 0.70
-        or _root_cause == "manual inspection required"
-        or _failure_mode == "insufficient evidence"
+
+    verified = state.verification.verified if state.verification else False
+    evidence_score = state.verification and getattr(state.verification, "evidence_score", 0.0) or 0.0
+    history_score = state.verification and getattr(state.verification, "history_score", 0.0) or 0.0
+    has_evidence = bool(state.retrieved_evidence)
+
+    disposition, fallback_reason = _classify_report(
+        confidence=_confidence,
+        verified=verified,
+        evidence_score=evidence_score,
+        history_score=history_score,
+        has_evidence=has_evidence,
     )
 
     pending: dict[str, Any] = {}
+    _telemetry: dict[str, Any] = {
+        "evidence_score": evidence_score,
+        "history_score": history_score,
+        "diagnosis_confidence": _confidence,
+        "verified": verified,
+        "fallback_used": False,
+        "uncertainty_reason": None,
+        "circuit_breaker_state": "CLOSED",
+        "final_report_status": disposition,
+    }
 
-    if diagnosis_uncertain:
+    # Track whether the LLM already emitted a fallback diagnosis
+    is_llm_fallback = (
+        _root_cause == "manual inspection required"
+        or _failure_mode == "insufficient evidence"
+    )
+
+    if disposition == ReportDisposition.FALLBACK or is_llm_fallback:
         _SAFE_ACTION = (
             "Perform manual inspection and validate sensor readings "
             "before executing repair procedures."
@@ -571,9 +642,11 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
             "Perform manual inspection before repair actions."
         )
 
-        # Mutate the diagnosis so downstream serializers and persistence store
-        # the safe message instead of an invented root cause.
-        if state.diagnosis:
+        _telemetry["fallback_used"] = True
+        _telemetry["uncertainty_reason"] = fallback_reason if not is_llm_fallback else "llm_insufficient_evidence"
+
+        # Only overwrite the diagnosis if the LLM itself did not already ask for inspection
+        if state.diagnosis and not is_llm_fallback:
             state.diagnosis.root_cause = _SAFE_ROOT_CAUSE
             state.diagnosis.failure_mode = "insufficient evidence"
 
@@ -584,14 +657,10 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
                 "priority": MaintenancePriority.URGENT,
             })
 
-        # Override verification — verified and notes
+        # Override verification — keep raw notes but mark verified False for safety
         if state.verification:
             pending["verification"] = state.verification.model_copy(update={
                 "verified": False,
-                "verification_notes": (
-                    "Diagnosis could not be corroborated. "
-                    "Escalate for manual inspection."
-                ),
             })
 
         # Override role report text fields after communication agent has set them
@@ -620,8 +689,27 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
             rr.manager.recommended_action = _SAFE_ACTION
         pending["role_reports"] = rr
 
+    elif disposition == ReportDisposition.CAUTIOUS:
+        _telemetry["uncertainty_reason"] = fallback_reason
+        # Preserve diagnosis and strategy, but sanitize any absolute certainty claims
+        # in role reports while keeping concrete component names and actions.
+        rr = state.role_reports
+        if rr.engineer and rr.engineer.safety_notes:
+            rr.engineer.safety_notes = _sanitize_uncertain_text(rr.engineer.safety_notes)
+        if rr.supervisor and rr.supervisor.resource_requirements:
+            rr.supervisor.resource_requirements = _sanitize_uncertain_text(
+                rr.supervisor.resource_requirements
+            )
+        if rr.manager and rr.manager.business_impact:
+            rr.manager.business_impact = _sanitize_uncertain_text(rr.manager.business_impact)
+        pending["role_reports"] = rr
+
+    else:
+        # SPECIFIC: preserve everything as-is
+        _telemetry["uncertainty_reason"] = None
+
     # Resolve effective strategy/verification (overridden if uncertain)
-    eff_strategy     = pending.get("strategy",     state.strategy)
+    eff_strategy = pending.get("strategy", state.strategy)
     eff_verification = pending.get("verification", state.verification)
 
     now = datetime.now(timezone.utc)
@@ -645,6 +733,13 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
             "manager":    state.role_reports.manager is not None,
         },
         "pipeline_errors": len(errors),
+        # Report-quality telemetry
+        "evidence_score": _telemetry.get("evidence_score"),
+        "history_score": _telemetry.get("history_score"),
+        "fallback_used": _telemetry.get("fallback_used"),
+        "uncertainty_reason": _telemetry.get("uncertainty_reason"),
+        "circuit_breaker_state": _telemetry.get("circuit_breaker_state"),
+        "final_report_status": _telemetry.get("final_report_status"),
     }
 
     trace = build_trace("finalize", start, now_utc(), "success")

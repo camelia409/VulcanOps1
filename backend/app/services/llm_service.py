@@ -106,13 +106,16 @@ _DIAGNOSIS_SYSTEM = (
     "You may ONLY use evidence explicitly present in this request: sensor readings, "
     "maintenance history, manuals, and SOPs provided below.\n"
     "CRITICAL: Never invent failures. Never infer from general mechanical knowledge. "
-    "Never guess a component failure that is not directly supported by the provided data.\n"
-    "If the available evidence does not clearly indicate a root cause, you MUST set:\n"
-    '  root_cause = "manual inspection required"\n'
-    '  failure_mode = "insufficient evidence"\n'
-    "  confidence = a value below 0.7\n"
-    "If evidence confidence < 0.7, root_cause MUST be 'manual inspection required'.\n"
-    "Do NOT hallucinate component names, failure modes, or sensor values not present in the data."
+    "Never guess a component failure that is not directly supported by the provided data.\n\n"
+    "CONFIDENCE SCALE:\n"
+    "- 0.70–0.89: Cautious diagnosis — evidence suggests a likely cause but is not definitive. "
+    "Use precise industrial language and note what is uncertain.\n"
+    "- 0.50–0.69: Preliminary diagnosis — some evidence points to a possible cause, but the signal is mixed. "
+    "State the most likely cause and the gaps that need confirmation.\n"
+    "- < 0.50: Insufficient evidence — set root_cause='manual inspection required', "
+    "failure_mode='insufficient evidence', and explain what data is missing.\n\n"
+    "When evidence is moderate or stronger, produce a concrete, actionable diagnosis with specific component or system names found in the data. "
+    "Do NOT default to generic fallback text when the evidence supports a real diagnosis."
     + _JSON_RULES
 )
 
@@ -129,8 +132,16 @@ _COPILOT_SYSTEM = (
 _COMMUNICATION_SYSTEM = (
     "You are a senior reliability engineer writing operational reports for an industrial plant. "
     "Respond ONLY with valid JSON. No prose, no markdown fences, no explanation outside the JSON object.\n"
-    "Each summary must be 150-200 words. "
-    'Required schema: {"engineer":"<string>","supervisor":"<string>","manager":"<string>"}'
+    "Each summary must be 150-200 words, specific, factual, and grounded in the evidence provided.\n"
+    'Required schema: {"engineer":"<string>","supervisor":"<string>","manager":"<string>"}\n\n'
+    "REPORT RULES:\n"
+    "- Use concrete component/system names and sensor values from the investigation summary.\n"
+    "- Cite evidence briefly (e.g., 'vibration 12% above threshold', 'maintenance history shows seal replacement').\n"
+    "- Do NOT use generic filler such as 'further investigation is needed' unless the summary explicitly states low confidence.\n"
+    "- Do NOT invent failures, costs, or timelines not present in the data.\n"
+    "- engineer: fault description, first checks, parts, safety, post-repair monitoring.\n"
+    "- supervisor: operational impact, resource needs, timeline, escalation.\n"
+    "- manager: business risk, cost exposure, compliance, strategic recommendation."
     + _JSON_RULES
 )
 
@@ -395,22 +406,16 @@ class OpenRouterLLMService:
         failure_mode = raw.get("failure_mode") or _DIAGNOSIS_FALLBACK["failure_mode"]
         reasoning    = raw.get("reasoning")    or _DIAGNOSIS_FALLBACK["reasoning"]
 
-        # Hard evidence-grounding enforcement: a diagnosis below 0.7 confidence
-        # is not actionable — override to require manual inspection rather than
-        # surfacing a hallucinated or weakly-supported root cause.
-        if confidence < 0.7:
+        # Preserve the LLM's diagnosis. A downstream uncertainty guard in
+        # graph_builder._finalize_node decides whether to collapse to fallback
+        # text based on confidence, verification, and evidence availability.
+        # This service only enforces sane bounds and valid JSON shape.
+        if confidence < 0.5 and root_cause != "manual inspection required":
             logger.info(
-                "Diagnosis confidence %.2f < 0.7 — overriding root_cause to "
-                "'manual inspection required' (was: %r)",
+                "Diagnosis confidence %.2f is low but not forcing fallback; "
+                "downstream finalizer will decide (was: %r)",
                 confidence,
                 root_cause,
-            )
-            root_cause   = "manual inspection required"
-            failure_mode = "insufficient evidence"
-            reasoning    = (
-                f"Evidence confidence {confidence:.2f} is below the 0.7 threshold. "
-                "Manual inspection is required before a root cause can be confirmed. "
-                f"Original LLM reasoning: {reasoning}"
             )
 
         return {

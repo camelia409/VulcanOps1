@@ -45,6 +45,9 @@ class VerificationResult(BaseModel):
     verified: bool
     verification_notes: str | None = None
     contradictions: list[str] = Field(default_factory=list)
+    evidence_score: float = Field(0.0, ge=0.0, le=1.0)
+    history_score: float = Field(0.0, ge=0.0, le=1.0)
+    combined_score: float = Field(0.0, ge=0.0, le=1.0)
 
 
 class ImpactAssessment(BaseModel):

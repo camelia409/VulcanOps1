@@ -141,19 +141,25 @@ def _build_monitoring_plan(state: VulcanOpsState, priority: MaintenancePriority)
 
 
 def _estimate_parts(state: VulcanOpsState) -> list[str]:
-    """Derive likely parts from machine type and failure mode keywords."""
+    """Derive likely parts from machine type, failure mode, and root cause keywords."""
     machine_type = (state.machine_context.machine_type if state.machine_context else "").lower()
     failure_mode = (state.diagnosis.failure_mode if state.diagnosis else "").lower()
+    root_cause = (state.diagnosis.root_cause if state.diagnosis else "").lower()
     sensor = (state.anomaly.sensor if state.anomaly else "")
 
+    combined = f"{failure_mode} {root_cause}"
     parts: list[str] = []
 
-    if "bearing" in failure_mode or "vibration" == sensor:
+    if "bearing" in combined or "vibration" == sensor:
         parts += ["Replacement bearings (OEM spec)", "Bearing grease / lubricant"]
-    if "seal" in failure_mode or "pressure" == sensor:
+    if "seal" in combined or "pressure" == sensor:
         parts += ["Seal kit", "O-rings"]
-    if "thermal" in failure_mode or "temperature" == sensor:
+    if "thermal" in combined or "temperature" == sensor:
         parts += ["Thermal gaskets", "Cooling fluid"]
+    if "coupling" in combined:
+        parts += ["Coupling alignment kit", "Replacement coupling inserts"]
+    if "lubrication" in combined or "oil" in combined:
+        parts += ["Correct grade lubricant / oil", "Oil filter"]
     if "pump" in machine_type:
         parts += ["Impeller inspection kit", "Mechanical seal"]
     if "motor" in machine_type:

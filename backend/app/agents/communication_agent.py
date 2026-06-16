@@ -92,11 +92,17 @@ def _build_prompt(state: VulcanOpsState) -> str:
 INVESTIGATION SUMMARY:
 {digest}
 
-Produce one report per audience. Each report must be 150-200 words, specific, factual, and professional.
+Produce one report per audience. Each report must be 150-200 words, specific, factual, and grounded in the evidence above.
 
-engineer: field engineer performing the repair — cover fault description, what to check first, parts needed, safety precautions, post-repair monitoring.
-supervisor: shift supervisor coordinating the response — cover operational impact, resource requirements, production line effects, timeline, escalation chain.
-manager: plant management — cover business risk, estimated cost, compliance obligations, strategic recommendation, programme implications.
+REPORT RULES:
+- Use concrete component/system names and sensor values from the summary.
+- Cite evidence briefly (e.g., 'vibration 12% above threshold', 'manual states inspect seal every 2000h').
+- Do NOT use generic filler such as 'further investigation is needed' unless the summary explicitly states low confidence or manual inspection.
+- Do NOT invent failures, costs, or timelines not present in the data.
+
+engineer: field engineer performing the repair — fault description, first checks, parts needed, safety precautions, post-repair monitoring.
+supervisor: shift supervisor coordinating the response — operational impact, resource requirements, production line effects, timeline, escalation.
+manager: plant management — business risk, cost exposure, compliance, strategic recommendation.
 
 Return JSON only."""
 

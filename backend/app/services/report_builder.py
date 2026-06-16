@@ -95,6 +95,9 @@ def build_single_report(state: VulcanOpsState) -> dict[str, Any]:
         else None
     )
 
+    # Report-quality telemetry from the finalizer (if available)
+    telemetry = state.final_report or {}
+
     return {
         "machine":              build_machine_summary(state),
         "risk_level":           state.impact.risk_level.value if state.impact and state.impact.risk_level else None,
@@ -115,6 +118,13 @@ def build_single_report(state: VulcanOpsState) -> dict[str, Any]:
         "execution_trace":      state.execution_trace,
         "pipeline_errors":      len(state.errors),
         "has_errors":           len(state.errors) > 0,
+        # Quality telemetry so the UI can explain why a report is specific/cautious/fallback
+        "evidence_score":       telemetry.get("evidence_score"),
+        "history_score":        telemetry.get("history_score"),
+        "fallback_used":        telemetry.get("fallback_used", False),
+        "uncertainty_reason":   telemetry.get("uncertainty_reason"),
+        "final_report_status":  telemetry.get("final_report_status"),
+        "circuit_breaker_state": telemetry.get("circuit_breaker_state"),
     }
 
 

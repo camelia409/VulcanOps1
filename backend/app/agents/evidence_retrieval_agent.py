@@ -124,6 +124,14 @@ def _build_query_keywords(state: VulcanOpsState) -> set[str]:
         keywords |= _tokenize(state.machine_context.machine_type)
         keywords |= _tokenize(state.machine_context.machine_name)
         keywords |= _tokenize(state.machine_context.plant)
+        keywords |= _tokenize(state.machine_context.location)
+
+    # Add the current fault signal so manuals/SOPs about the specific symptom rank higher.
+    if state.anomaly and state.anomaly.sensor:
+        keywords |= _tokenize(state.anomaly.sensor)
+        if state.anomaly.deviation_percent is not None and state.anomaly.deviation_percent > 0:
+            keywords.add("high")
+            keywords.add("elevated")
 
     for record in state.maintenance_history:
         keywords |= _tokenize(record.failure_mode)
@@ -167,16 +175,21 @@ def run(state: VulcanOpsState) -> AgentResult:
             if not chunk_keywords:
                 continue
             overlap = query_keywords & chunk_keywords
-            score = len(overlap) / len(query_keywords)
-            if score > 0.0:
-                scored.append(
-                    {
-                        "source": filename,
-                        "source_type": source_type,
-                        "chunk": chunk,
-                        "relevance_score": round(score, 4),
-                    }
-                )
+            if not overlap:
+                continue
+            # Balanced F1-style score: rewards chunks that cover many query terms
+            # (recall) while also being focused on those terms (precision).
+            recall = len(overlap) / len(query_keywords)
+            precision = len(overlap) / len(chunk_keywords)
+            score = 2 * (precision * recall) / (precision + recall) if (precision + recall) else 0.0
+            scored.append(
+                {
+                    "source": filename,
+                    "source_type": source_type,
+                    "chunk": chunk,
+                    "relevance_score": round(score, 4),
+                }
+            )
 
     scored.sort(key=lambda x: x["relevance_score"], reverse=True)
     top = scored[:_TOP_K]
