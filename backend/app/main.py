@@ -1,12 +1,19 @@
-# langchain 1.2.x ships an empty __init__.py; langchain-core's globals.py
-# checks _HAS_LANGCHAIN=True and then reads langchain.debug / .verbose /
-# .llm_cache — which don't exist, causing AttributeError inside langgraph.
-# Inject the missing attributes before any langgraph import resolves them.
-import langchain as _lc
-for _attr, _default in (("debug", False), ("verbose", False), ("llm_cache", None)):
-    if not hasattr(_lc, _attr):
-        setattr(_lc, _attr, _default)
-del _lc, _attr, _default
+# Defensive shim: some langchain / langchain-core combinations check for
+# _HAS_LANGCHAIN=True and then read langchain.debug / .verbose / .llm_cache.
+# If the installed langchain package is missing those attributes (e.g. a stub
+# or empty __init__.py), inject defaults before any langgraph import resolves
+# them and triggers an AttributeError.
+try:
+    import langchain as _lc
+except ImportError:
+    _lc = None
+if _lc is not None:
+    for _attr, _default in (("debug", False), ("verbose", False), ("llm_cache", None)):
+        if not hasattr(_lc, _attr):
+            setattr(_lc, _attr, _default)
+    del _lc, _attr, _default
+else:
+    del _lc
 
 from contextlib import asynccontextmanager
 from pathlib import Path
