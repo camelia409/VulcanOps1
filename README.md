@@ -143,7 +143,7 @@ Interactive docs: `http://localhost:8000/docs`
 1. Create a **Web Service** from `backend/`. Use:
    - Build command: `pip install -r requirements.txt`
    - Start command: `./start.sh` (or `bash start.sh` if the executable bit is not set)
-   - Python version: `backend/runtime.txt` pins `python-3.11.10`
+   - Python version: `backend/.python-version` pins `3.11.10` (Render reads this file; `runtime.txt` is not supported)
 2. Set environment variables:
    - `DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/db` (Render also accepts `postgres://`; config converts it)
    - `ALLOWED_ORIGINS=https://your-frontend.vercel.app,http://localhost:5173`
