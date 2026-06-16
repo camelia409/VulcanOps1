@@ -109,9 +109,13 @@ class Settings(BaseSettings):
 
     @property
     def allowed_origins_list(self) -> list[str]:
-        origins = {o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()}
+        origins = {
+            o.strip().rstrip("/")
+            for o in self.ALLOWED_ORIGINS.split(",")
+            if o.strip()
+        }
         if self.FRONTEND_URL and self.FRONTEND_URL.strip():
-            origins.add(self.FRONTEND_URL.strip())
+            origins.add(self.FRONTEND_URL.strip().rstrip("/"))
         return list(origins)
 
 settings = Settings()

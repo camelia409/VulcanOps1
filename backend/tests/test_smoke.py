@@ -37,6 +37,20 @@ def test_allowed_origins_includes_frontend_url():
     assert "https://app.vercel.app" in s.allowed_origins_list
 
 
+def test_allowed_origins_strips_trailing_slashes():
+    from app.core.config import Settings
+
+    s = Settings(
+        ALLOWED_ORIGINS="https://vulcan-ops1.vercel.app/,http://localhost:5173",
+        FRONTEND_URL="https://app.vercel.app/",
+    )
+    assert "https://vulcan-ops1.vercel.app" in s.allowed_origins_list
+    assert "https://vulcan-ops1.vercel.app/" not in s.allowed_origins_list
+    assert "http://localhost:5173" in s.allowed_origins_list
+    assert "https://app.vercel.app" in s.allowed_origins_list
+    assert "https://app.vercel.app/" not in s.allowed_origins_list
+
+
 def test_fastapi_app_imports():
     """The app factory must import without crashing."""
     from app.main import app

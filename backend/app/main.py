@@ -18,6 +18,8 @@ else:
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -69,6 +71,8 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
 
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI(
     title="VulcanOps",
     version="0.1.0",
@@ -77,9 +81,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_origins = settings.allowed_origins_list
+logger.info("CORS allowed origins: %s", _origins)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_origins_list,
+    allow_origins=_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
