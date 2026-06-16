@@ -1,0 +1,40 @@
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+
+# Database
+sqlalchemy==2.0.36
+alembic==1.14.0
+asyncpg==0.30.0
+
+# InfluxDB
+influxdb-client==1.48.0
+
+# Redis
+redis==5.2.0
+
+# Config & environment
+pydantic==2.10.3
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+
+# Auth
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.18
+
+# Agentic orchestration
+langgraph==0.2.60
+langchain==1.2.18  # explicit dependency; langgraph imports from langchain
+
+# CSV & PDF processing
+pandas==2.3.0
+numpy==2.2.1
+pdfplumber==0.11.4
+reportlab==4.2.5
+
+# LLM — OpenRouter via OpenAI-compatible SDK
+openai==1.58.1
+
+# HTTP client
+httpx==0.28.1

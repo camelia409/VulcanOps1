@@ -1,0 +1,16 @@
+machine_id,machine_name,machine_type,plant,location,criticality,status
+bdd640fb-0667-1ad1-1c80-317fa3b1799d,Air Compressor A,Compressor,Plant A,Building A1,CRITICAL,OPERATIONAL
+23b8c1e9-3924-56de-3eb1-3b9046685257,Blast Furnace 1,Blast Furnace,Plant A,Furnace Bay 1,CRITICAL,DEGRADED
+bd9c66b3-ad3c-2d6d-1a3d-1fa7bc8960a9,Cooling Pump 2,Pump,Plant B,Utility Block 2,HIGH,OPERATIONAL
+972a8469-1641-9f82-8b9d-2434e465e150,Conveyor Belt X,Conveyor,Plant B,Assembly Line 3,MEDIUM,OPERATIONAL
+17fc695a-07a0-ca6e-0822-e8f36c031199,Robotic Arm 3,Robotic Arm,Plant C,Welding Cell 3,HIGH,DEGRADED
+9a1de644-815e-f6d1-3b8f-aa1837f8a88b,HVAC System 1,HVAC,Plant A,Rooftop Unit A,LOW,OPERATIONAL
+b74d0fb1-32e7-0629-8fad-c1a606cb0fb3,Air Compressor B,Compressor,Plant B,Building B2,CRITICAL,UNDER_MAINTENANCE
+6b65a6a4-8b81-48f6-b38a-088ca65ed389,Centrifuge Alpha,Centrifuge,Plant C,Lab Block C1,HIGH,OPERATIONAL
+47378190-96da-1dac-72ff-5d2a386ecbe0,Cooling Pump 3,Pump,Plant A,Utility Block 1,MEDIUM,DEGRADED
+c241330b-01a9-e71f-de8a-774bcf36d58b,Generator 1,Generator,Plant B,Power House B,CRITICAL,OPERATIONAL
+6c307511-b2b9-437a-28df-6ec4ce4a2bbd,Generator 2,Generator,Plant B,Power House B,CRITICAL,OFFLINE
+371ecd7b-27cd-8130-4722-9389571aa876,Hydraulic Press 1,Press,Plant C,Press Bay C2,HIGH,OPERATIONAL
+1a2a73ed-562b-0f79-c374-59eef50bea63,Conveyor Belt Y,Conveyor,Plant A,Assembly Line 1,MEDIUM,OPERATIONAL
+5be6128e-18c2-6797-6142-ea7d17be3111,Air Compressor C,Compressor,Plant C,Building C3,CRITICAL,OPERATIONAL
+43b7a3a6-9a8d-ca03-580d-7b71d8f56413,Milling Machine 1,Milling,Plant B,Machine Shop B1,HIGH,DEGRADED

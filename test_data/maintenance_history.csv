@@ -1,0 +1,21 @@
+machine_id,date,failure_mode,action_taken,downtime_hours,engineer
+bdd640fb-0667-1ad1-1c80-317fa3b1799d,2026-05-10,Bearing Wear,Replaced bearing assembly,5,J. Sharma
+bdd640fb-0667-1ad1-1c80-317fa3b1799d,2026-03-22,Lubrication Failure,Oil replenishment and full flush,2,J. Sharma
+bdd640fb-0667-1ad1-1c80-317fa3b1799d,2025-12-15,Overpressure,Adjusted relief valve setting,2,R. Nair
+23b8c1e9-3924-56de-3eb1-3b9046685257,2026-06-01,Thermal Sensor Fault,Replaced temperature sensor unit,3,T. Okafor
+23b8c1e9-3924-56de-3eb1-3b9046685257,2026-04-15,Refractory Wear,Patched inner furnace lining,12,T. Okafor
+bd9c66b3-ad3c-2d6d-1a3d-1fa7bc8960a9,2026-05-28,Seal Leakage,Replaced mechanical seal assembly,4,P. Chen
+972a8469-1641-9f82-8b9d-2434e465e150,2026-02-14,Motor Overheating,Cleaned vents and replaced cooling fan,6,A. Kumar
+17fc695a-07a0-ca6e-0822-e8f36c031199,2026-06-10,Calibration Error,Recalibrated all six joints,1,S. Melo
+17fc695a-07a0-ca6e-0822-e8f36c031199,2026-05-05,Actuator Failure,Replaced wrist joint actuator,8,S. Melo
+9a1de644-815e-f6d1-3b8f-aa1837f8a88b,2026-01-20,Filter Clog,Replaced air filters and cleaned ducts,1,R. Nair
+b74d0fb1-32e7-0629-8fad-c1a606cb0fb3,2026-06-14,Rotor Imbalance,Removed rotor for dynamic balancing,24,J. Sharma
+b74d0fb1-32e7-0629-8fad-c1a606cb0fb3,2026-03-10,Valve Stick,Cleaned and lubricated intake valve,3,J. Sharma
+6b65a6a4-8b81-48f6-b38a-088ca65ed389,2026-04-22,Vibration High,Replaced vibration dampener mounts,5,P. Chen
+47378190-96da-1dac-72ff-5d2a386ecbe0,2026-06-12,Impeller Damage,Replaced damaged impeller,10,A. Kumar
+c241330b-01a9-e71f-de8a-774bcf36d58b,2026-05-18,Fuel Line Blockage,Flushed and purged fuel system,4,T. Okafor
+6c307511-b2b9-437a-28df-6ec4ce4a2bbd,2026-06-05,Alternator Failure,Replaced alternator unit,16,T. Okafor
+371ecd7b-27cd-8130-4722-9389571aa876,2026-02-28,Hydraulic Leak,Replaced hydraulic hoses and seals,6,P. Chen
+1a2a73ed-562b-0f79-c374-59eef50bea63,2026-05-30,Belt Tear,Installed new conveyor belt,4,A. Kumar
+5be6128e-18c2-6797-6142-ea7d17be3111,2026-04-01,Lubrication Degradation,Full fluid flush and oil change,3,R. Nair
+43b7a3a6-9a8d-ca03-580d-7b71d8f56413,2026-06-11,Spindle Wear,Replaced spindle bearings,8,S. Melo
