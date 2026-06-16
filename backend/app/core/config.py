@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -54,12 +55,43 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
-        if self.DATABASE_URL:
-            return self._to_asyncpg(self.DATABASE_URL)
-        return (
-            f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
+        return self._parse_database_url()[0]
+
+    @property
+    def database_connect_args(self) -> dict:
+        """Extra connect_args for asyncpg (e.g. translating ?sslmode=...)."""
+        return self._parse_database_url()[1]
+
+    def _parse_database_url(self) -> tuple[str, dict]:
+        """Return (asyncpg_url, connect_args).
+
+        Render and other hosts often append ?sslmode=require to DATABASE_URL.
+        asyncpg does not accept ``sslmode`` as a connect keyword; it expects
+        ``ssl`` instead, so we strip it from the URL and pass it via
+        ``connect_args``.
+        """
+        url = self.DATABASE_URL or (
+            f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
+
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        sslmode = query.pop("sslmode", [None])[0]
+
+        # Rebuild URL without sslmode so asyncpg doesn't see it.
+        parsed = parsed._replace(query=urlencode(query, doseq=True))
+        clean_url = urlunparse(parsed)
+
+        if clean_url.startswith("postgres://"):
+            clean_url = clean_url.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif clean_url.startswith("postgresql://"):
+            clean_url = clean_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+        connect_args: dict = {}
+        if sslmode:
+            connect_args["ssl"] = sslmode
+        return clean_url, connect_args
 
     @property
     def redis_url(self) -> str:
@@ -81,18 +113,5 @@ class Settings(BaseSettings):
         if self.FRONTEND_URL and self.FRONTEND_URL.strip():
             origins.add(self.FRONTEND_URL.strip())
         return list(origins)
-
-    @staticmethod
-    def _to_asyncpg(url: str) -> str:
-        """Render DATABASE_URL often starts with postgres:// or postgresql://.
-
-        SQLAlchemy asyncpg driver requires postgresql+asyncpg://.
-        """
-        if url.startswith("postgres://"):
-            return url.replace("postgres://", "postgresql+asyncpg://", 1)
-        if url.startswith("postgresql://"):
-            return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-        return url
-
 
 settings = Settings()

@@ -14,6 +14,18 @@ def test_database_url_conversion():
     assert s.database_url == "postgresql+asyncpg://user:pass@render-host:5432/dbname"
 
 
+def test_database_url_strips_sslmode_for_asyncpg():
+    """asyncpg does not accept sslmode as a connect keyword."""
+    from app.core.config import Settings
+
+    s = Settings(
+        DATABASE_URL="postgresql://user:pass@render-host:5432/dbname?sslmode=require",
+        APP_ENV="production",
+    )
+    assert s.database_url == "postgresql+asyncpg://user:pass@render-host:5432/dbname"
+    assert s.database_connect_args == {"ssl": "require"}
+
+
 def test_allowed_origins_includes_frontend_url():
     from app.core.config import Settings
 
