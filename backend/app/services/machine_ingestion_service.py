@@ -6,11 +6,15 @@ import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import logging
+
 from app.core.enums import MachineCriticality, MachineStatus
 from app.models.ingested_file import IngestedFile
 from app.models.machine import Machine
 from app.schemas.upload_response import UploadResponse
 from app.services.ingestion_file_tracker import update_ingested_file
+
+logger = logging.getLogger(__name__)
 
 STORAGE_DIR = Path(__file__).resolve().parents[2] / "storage" / "uploads" / "machine_registry"
 
@@ -32,6 +36,33 @@ _COLUMN_ALIASES = {
 
 VALID_CRITICALITY = {e.value for e in MachineCriticality}
 VALID_STATUS = {e.value for e in MachineStatus}
+
+
+def _parse_enum_value(raw: str | None, enum_cls: type) -> str | None:
+    """Normalize a raw CSV enum value to the enum's lowercase value.
+
+    Accepts either the enum value (e.g. 'critical') or the member name
+    (e.g. 'CRITICAL') in any casing, so spreadsheets with uppercase
+    labels still ingest correctly.
+    """
+    if raw is None:
+        return None
+    cleaned = str(raw).strip().lower()
+    if not cleaned:
+        return None
+
+    # First try matching by value ('critical', 'operational', etc.)
+    for member in enum_cls:
+        if member.value == cleaned:
+            return member.value
+
+    # Fallback: match by member name ('CRITICAL', 'OPERATIONAL', etc.)
+    upper = cleaned.upper()
+    for member in enum_cls:
+        if member.name == upper:
+            return member.value
+
+    return cleaned
 
 
 def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
@@ -88,17 +119,24 @@ async def ingest_machines(
         row_errors: list[str] = []
 
         # Validate enum fields
-        criticality_val = str(row.get("criticality", "")).strip().lower()
-        status_val = str(row.get("status", "")).strip().lower()
+        raw_criticality = row.get("criticality", "")
+        raw_status = row.get("status", "")
+        criticality_val = _parse_enum_value(raw_criticality, MachineCriticality)
+        status_val = _parse_enum_value(raw_status, MachineStatus)
 
-        if criticality_val not in VALID_CRITICALITY:
+        logger.debug(
+            "Row %s raw criticality=%r status=%r parsed criticality=%r status=%r",
+            row_num, raw_criticality, raw_status, criticality_val, status_val,
+        )
+
+        if criticality_val is None or criticality_val not in VALID_CRITICALITY:
             row_errors.append(
-                f"Row {row_num}: invalid criticality '{criticality_val}'. "
+                f"Row {row_num}: invalid criticality '{raw_criticality}'. "
                 f"Must be one of {sorted(VALID_CRITICALITY)}"
             )
-        if status_val not in VALID_STATUS:
+        if status_val is None or status_val not in VALID_STATUS:
             row_errors.append(
-                f"Row {row_num}: invalid status '{status_val}'. "
+                f"Row {row_num}: invalid status '{raw_status}'. "
                 f"Must be one of {sorted(VALID_STATUS)}"
             )
 

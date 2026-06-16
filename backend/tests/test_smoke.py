@@ -51,6 +51,15 @@ def test_allowed_origins_strips_trailing_slashes():
     assert "https://app.vercel.app/" not in s.allowed_origins_list
 
 
+def test_machine_ingestion_parses_uppercase_enums():
+    from app.services.machine_ingestion_service import _parse_enum_value
+    from app.core.enums import MachineCriticality, MachineStatus
+
+    assert _parse_enum_value("CRITICAL", MachineCriticality) == "critical"
+    assert _parse_enum_value("OPERATIONAL", MachineStatus) == "operational"
+    assert _parse_enum_value("  High  ", MachineCriticality) == "high"
+
+
 def test_fastapi_app_imports():
     """The app factory must import without crashing."""
     from app.main import app

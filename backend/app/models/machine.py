@@ -20,10 +20,19 @@ class Machine(Base):
     plant: Mapped[str] = mapped_column(String(255), nullable=False)
     location: Mapped[str] = mapped_column(String(255), nullable=False)
     criticality: Mapped[MachineCriticality] = mapped_column(
-        Enum(MachineCriticality, name="machine_criticality"), nullable=False
+        Enum(
+            MachineCriticality,
+            name="machine_criticality",
+            values_callable=lambda obj: [e.value for e in obj],
+        ),
+        nullable=False,
     )
     status: Mapped[MachineStatus] = mapped_column(
-        Enum(MachineStatus, name="machine_status"),
+        Enum(
+            MachineStatus,
+            name="machine_status",
+            values_callable=lambda obj: [e.value for e in obj],
+        ),
         nullable=False,
         default=MachineStatus.OPERATIONAL,
     )

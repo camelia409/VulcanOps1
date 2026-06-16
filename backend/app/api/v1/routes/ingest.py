@@ -280,6 +280,10 @@ async def ingest_files(
                     "errors": [str(exc)],
                 }
             )
+            # The session may contain invalid pending changes from the failed
+            # ingestion (e.g. bad enum values). Roll back before updating the
+            # tracking record so we don't hit PendingRollbackError.
+            await db.rollback()
             # Mark the file record as failed.
             await update_ingested_file(
                 db,
