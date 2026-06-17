@@ -248,7 +248,7 @@ async def _get_copilot_answer(report: dict[str, Any], query: str) -> str | None:
     if cache_key in _COPILOT_CACHE:
         return _COPILOT_CACHE[cache_key]
 
-    facts = "\n".join([
+    facts_lines = [
         f"Machine: {machine.get('machine_name', 'Unknown')}",
         f"Type: {machine.get('machine_type', 'Unknown')}",
         f"Priority: {report.get('priority', 'Unknown')}",
@@ -259,7 +259,36 @@ async def _get_copilot_answer(report: dict[str, Any], query: str) -> str | None:
         f"Failure Mode: {report.get('failure_mode', 'Unknown')}",
         f"Recommended Action: {report.get('recommended_action', 'Unknown')}",
         f"Analysis Type: {report.get('deep_analysis_status', 'done')}",
-    ])
+    ]
+
+    # Explainability facts — let the copilot answer "Why?" / "Show evidence" questions
+    explainability_score = report.get("explainability_score")
+    if explainability_score is not None:
+        facts_lines.append(f"Explainability Score: {explainability_score}/100")
+
+    evidence_chain = report.get("evidence_chain") or []
+    if evidence_chain:
+        facts_lines.append("Evidence Chain:")
+        for item in evidence_chain:
+            facts_lines.append(
+                f"  Step {item.get('step')}: [{item.get('type')}] {item.get('source')} — {item.get('evidence')}"
+            )
+
+    # Procurement gap facts — let the copilot answer "Is procurement at risk?"
+    procurement_gap = report.get("procurement_gap") or {}
+    if procurement_gap.get("procurement_gap"):
+        facts_lines.append("Procurement Gap: Detected")
+        facts_lines.append(
+            f"Procurement Action: {procurement_gap.get('recommended_action', 'Expedite parts procurement')}"
+        )
+        for at_risk in procurement_gap.get("at_risk_parts", []):
+            facts_lines.append(
+                f"  At-risk part: {at_risk.get('part')} (lead {at_risk.get('lead_time_days')} days, RUL {at_risk.get('rul_days')} days)"
+            )
+    else:
+        facts_lines.append("Procurement Gap: No detected lead-time risk")
+
+    facts = "\n".join(facts_lines)
 
     try:
         answer = await llm_service.generate_copilot_answer(facts, query)

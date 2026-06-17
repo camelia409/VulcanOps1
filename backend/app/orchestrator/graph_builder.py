@@ -14,15 +14,26 @@ Invariants enforced as node guards (skipped nodes are traced, not crashed):
     5. finalize blocks  final_report construction when root_cause is missing
 """
 
+import contextvars
 import json
 import logging
 import re
+import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
 _PIPELINE_LOG = logging.getLogger("vulcanops.pipeline")
+
+# Optional progress callback injected by run_pipeline for job-stage tracking.
+# Stored in a context variable so the compiled LangGraph nodes can report
+# progress without polluting VulcanOpsState or the global graph singleton.
+_ProgressCallback = Callable[[str], Awaitable[None]] | None
+_progress_callback_ctx: contextvars.ContextVar[_ProgressCallback] = contextvars.ContextVar(
+    "_progress_callback_ctx", default=None
+)
 
 # ── uncertain-diagnosis text sanitizer ───────────────────────────────────────
 
@@ -81,6 +92,54 @@ def _append_trace(state: VulcanOpsState, trace: dict) -> list[dict[str, Any]]:
 
 def _append_error(state: VulcanOpsState, agent: str, errors: list[str]) -> list[dict[str, Any]]:
     return state.errors + [{"agent": agent, "errors": errors}]
+
+
+def _trace_node(name: str, fn):
+    """Wrap a graph node so it emits structured START/END logs and optional progress updates."""
+    async def wrapper(state: VulcanOpsState) -> dict[str, Any]:
+        machine_name = (
+            state.machine_context.machine_name
+            if state.machine_context
+            else str(state.active_machine_id)
+        )
+        _PIPELINE_LOG.info(json.dumps({
+            "event": "deep_analysis",
+            "machine": machine_name,
+            "step": name,
+            "status": "start",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }))
+
+        # Report stage progress to any active job observer.
+        progress_cb = _progress_callback_ctx.get()
+        if progress_cb is not None:
+            try:
+                await progress_cb(name)
+            except Exception:
+                logger.exception("Progress callback failed for stage %s", name)
+
+        start = time.monotonic()
+        try:
+            result = await fn(state)
+        except Exception as exc:
+            _PIPELINE_LOG.error(json.dumps({
+                "event": "deep_analysis",
+                "machine": machine_name,
+                "step": name,
+                "status": "error",
+                "duration_ms": round((time.monotonic() - start) * 1000, 1),
+                "error": str(exc),
+            }))
+            raise
+        _PIPELINE_LOG.info(json.dumps({
+            "event": "deep_analysis",
+            "machine": machine_name,
+            "step": name,
+            "status": "end",
+            "duration_ms": round((time.monotonic() - start) * 1000, 1),
+        }))
+        return result
+    return wrapper
 
 
 def _merge_llm_telemetry(state: VulcanOpsState, raw: dict) -> LLMTelemetry:
@@ -167,7 +226,7 @@ async def _prognostics_node(state: VulcanOpsState) -> dict:
 async def _evidence_retrieval_node(state: VulcanOpsState) -> dict:
     start = now_utc()
     try:
-        result: AgentResult = evidence_retrieval_agent.run(state)
+        result: AgentResult = await evidence_retrieval_agent.run(state)
     except Exception as exc:
         result = AgentResult(status="error", data={}, errors=[str(exc)])
     end = now_utc()
@@ -562,6 +621,185 @@ def _classify_report(
     return ReportDisposition.FALLBACK, "insufficient_evidence"
 
 
+# ── explainability & procurement gap helpers ──────────────────────────────────
+
+# Part → typical procurement lead time in days.
+# Keys are written as human-readable phrases; matching normalises underscores
+# so "thermal gasket" matches both key and free-text part descriptions.
+_PROCUREMENT_LEAD_TIMES = {
+    "bearing": 21,
+    "coupling": 14,
+    "lubricant": 3,
+    "oil": 3,
+    "thermal gasket": 10,
+}
+
+
+def _build_evidence_chain(state: VulcanOpsState) -> list[dict[str, Any]]:
+    """Construct a human-readable evidence chain from existing agent outputs.
+
+    Uses only fields already populated by anomaly, evidence_retrieval, and
+    maintenance_history agents — no new agents required.
+    """
+    chain: list[dict[str, Any]] = []
+    step = 1
+
+    # 1. Sensor evidence from anomaly agent
+    if state.anomaly and state.anomaly.detected:
+        sensor = state.anomaly.sensor or "sensor"
+        value = state.anomaly.value
+        threshold = state.anomaly.threshold
+        deviation = state.anomaly.deviation_percent
+        pieces: list[str] = []
+        if value is not None:
+            pieces.append(f"{sensor}={value:.2f}")
+        if threshold is not None:
+            pieces.append(f"threshold={threshold:.2f}")
+        if deviation is not None:
+            pieces.append(f"deviation={deviation:.1f}%")
+        evidence = "; ".join(pieces) if pieces else f"{sensor} anomaly detected"
+        chain.append({
+            "step": step,
+            "type": "sensor",
+            "source": "sensor_readings",
+            "evidence": evidence,
+        })
+        step += 1
+    elif state.anomaly:
+        chain.append({
+            "step": step,
+            "type": "sensor",
+            "source": "sensor_readings",
+            "evidence": "No anomaly detected in current sensor window",
+        })
+        step += 1
+
+    # 2. Historical evidence from maintenance records
+    if state.maintenance_history:
+        latest = state.maintenance_history[0]
+        evidence = (
+            f"{latest.action_taken or 'Maintenance action'} "
+            f"for {latest.failure_mode or 'failure mode'} "
+            f"on {latest.date.isoformat() if latest.date else 'recorded date'}"
+        )
+        chain.append({
+            "step": step,
+            "type": "history",
+            "source": "maintenance_history",
+            "evidence": evidence,
+        })
+        step += 1
+
+    # 3. Manual / documentary evidence from evidence_retrieval agent
+    if state.retrieved_evidence:
+        top = state.retrieved_evidence[0]
+        source = top.get("source", "equipment_manual")
+        chunk = top.get("chunk", "")
+        # Truncate very long chunks for readability while keeping meaning.
+        evidence = chunk[:280] + "…" if len(chunk) > 280 else chunk
+        chain.append({
+            "step": step,
+            "type": "manual",
+            "source": source,
+            "evidence": evidence,
+        })
+
+    return chain
+
+
+def _compute_explainability_score(evidence_chain: list[dict[str, Any]]) -> int:
+    """0-100 score reflecting how well the diagnosis is grounded across sources."""
+    type_counts: dict[str, int] = {}
+    for item in evidence_chain:
+        type_counts[item.get("type", "")] = type_counts.get(item.get("type", ""), 0) + 1
+
+    # Cap each source category at 1 so the score maxes at 100 when all three
+    # source types are present.
+    sensor = min(type_counts.get("sensor", 0), 1)
+    history = min(type_counts.get("history", 0), 1)
+    manual = min(type_counts.get("manual", 0), 1)
+
+    raw = sensor * 0.4 + history * 0.3 + manual * 0.3
+    return min(int(raw * 100), 100)
+
+
+def _match_parts_to_lead_times(
+    parts_required: list[str],
+    root_cause: str | None = None,
+    failure_mode: str | None = None,
+) -> dict[str, int]:
+    """Map free-text parts to known lead-time categories (case-insensitive).
+
+    Searches both the strategy parts list and the diagnosis text so gaps are
+    detected even when the parts list contains only a generic placeholder.
+    """
+    matched: dict[str, int] = {}
+    diagnosis_text = " ".join(filter(None, [root_cause, failure_mode])).lower()
+
+    for part in parts_required:
+        part_lower = part.lower()
+        for key, lead in _PROCUREMENT_LEAD_TIMES.items():
+            key_lower = key.lower()
+            if key_lower in part_lower or key_lower.replace(" ", "_") in part_lower:
+                matched[part] = lead
+                break
+
+    # Also scan root_cause / failure_mode for part keywords not already present
+    # in the parts list. This keeps the gap grounded in the diagnosis itself.
+    for key, lead in _PROCUREMENT_LEAD_TIMES.items():
+        key_lower = key.lower()
+        if key_lower in diagnosis_text or key_lower.replace(" ", "_") in diagnosis_text:
+            if key not in matched:
+                matched[key] = lead
+
+    return matched
+
+
+def _compute_procurement_gap(state: VulcanOpsState) -> dict[str, Any]:
+    """Detect parts whose lead time exceeds the predicted RUL.
+
+    Returns a dict suitable for embedding in final_report_json.
+    """
+    rul_hours = state.rul_prediction.remaining_useful_life_hours if state.rul_prediction else None
+    parts_required = state.strategy.parts_required if state.strategy else []
+    root_cause = state.diagnosis.root_cause if state.diagnosis else None
+    failure_mode = state.diagnosis.failure_mode if state.diagnosis else None
+
+    result: dict[str, Any] = {
+        "procurement_gap": False,
+        "rul_days": None,
+        "at_risk_parts": [],
+    }
+
+    if rul_hours is None:
+        return result
+
+    rul_days = rul_hours / 24.0
+    result["rul_days"] = round(rul_days, 1)
+
+    matched = _match_parts_to_lead_times(parts_required, root_cause, failure_mode)
+    at_risk: list[dict[str, Any]] = []
+    for part, lead_days in matched.items():
+        if rul_days < lead_days:
+            at_risk.append({
+                "part": part,
+                "lead_time_days": lead_days,
+                "rul_days": round(rul_days, 1),
+                "gap_days": round(lead_days - rul_days, 1),
+            })
+
+    if at_risk:
+        result["procurement_gap"] = True
+        result["at_risk_parts"] = at_risk
+        first = at_risk[0]
+        result["recommended_action"] = (
+            f"Expedite {first['part']} procurement. "
+            f"Current lead time ({first['lead_time_days']} days) exceeds predicted remaining life ({first['rul_days']} days)."
+        )
+
+    return result
+
+
 # ── node: finalize — Invariants 4 & 5 ────────────────────────────────────────
 
 
@@ -588,9 +826,62 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
             state.diagnosis, errors,
         )
         trace = build_trace("finalize", start, now_utc(), "error")
+
+        # Build stub role reports so StoredRoleReport is never empty after a
+        # completed deep-analysis job, even when the pipeline failed early.
+        _SAFE_ACTION = (
+            "Perform manual inspection and validate sensor readings "
+            "before executing repair procedures."
+        )
+        _SAFE_CONTENT = (
+            "Evidence is insufficient to determine root cause. "
+            "Perform manual inspection before repair actions."
+        )
+        _now_rr = datetime.now(timezone.utc)
+        _mid = state.active_machine_id
+        _rl = state.impact.risk_level if state.impact else RiskLevel.MEDIUM
+
+        stub_diagnosis = DiagnosisResult(
+            root_cause="manual inspection required",
+            failure_mode="insufficient evidence",
+            confidence=0.0,
+        )
+        stub_reports = RoleReports(
+            engineer=EngineerReport(
+                report_id=uuid.uuid4(), machine_id=_mid, generated_at=_now_rr,
+                root_cause="manual inspection required",
+                recommended_action=_SAFE_ACTION,
+                risk_level=_rl, confidence=0.0,
+                priority=MaintenancePriority.URGENT,
+                estimated_repair_hours=0.0, parts_required=[],
+                safety_notes=_SAFE_CONTENT,
+            ),
+            supervisor=SupervisorReport(
+                report_id=uuid.uuid4(), machine_id=_mid, generated_at=_now_rr,
+                risk_level=_rl, priority=MaintenancePriority.URGENT,
+                recommended_action=_SAFE_ACTION,
+                estimated_downtime_hours=0.0, affected_production_lines=[],
+                resource_requirements=(
+                    "Pending manual inspection. Do not allocate repair resources "
+                    "until diagnosis is confirmed."
+                ),
+            ),
+            manager=ManagerReport(
+                report_id=uuid.uuid4(), machine_id=_mid, generated_at=_now_rr,
+                risk_level=_rl, root_cause="manual inspection required",
+                business_impact=(
+                    "Analysis incomplete — manual inspection required before "
+                    "business impact can be quantified."
+                ),
+                estimated_cost_usd=0.0, recommended_action=_SAFE_ACTION,
+                compliance_flags=[],
+            ),
+        )
         return {
             "execution_trace": _append_trace(state, trace),
             "errors": errors,
+            "diagnosis": stub_diagnosis,
+            "role_reports": stub_reports,
         }
 
     # ── EVIDENCE- AND CONFIDENCE-AWARE FINALIZATION ───────────────────────────
@@ -615,6 +906,10 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
     )
 
     pending: dict[str, Any] = {}
+    evidence_chain = _build_evidence_chain(state)
+    explainability_score = _compute_explainability_score(evidence_chain)
+    procurement_gap = _compute_procurement_gap(state)
+
     _telemetry: dict[str, Any] = {
         "evidence_score": evidence_score,
         "history_score": history_score,
@@ -624,6 +919,9 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
         "uncertainty_reason": None,
         "circuit_breaker_state": "CLOSED",
         "final_report_status": disposition,
+        "evidence_chain": evidence_chain,
+        "explainability_score": explainability_score,
+        "procurement_gap": procurement_gap,
     }
 
     # Track whether the LLM already emitted a fallback diagnosis
@@ -663,30 +961,73 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
                 "verified": False,
             })
 
-        # Override role report text fields after communication agent has set them
+        # Override role report text fields after communication agent has set them.
+        # If communication was skipped (strategy was None), create stub reports so
+        # StoredRoleReport is never stored with empty content.
         rr = state.role_reports
-        if rr.engineer:
+        _rl_fb = state.impact.risk_level if state.impact else RiskLevel.MEDIUM
+        _now_fb = datetime.now(timezone.utc)
+        _mid_fb = state.active_machine_id
+        _conf_fb = _confidence
+
+        if rr.engineer is None:
+            rr = RoleReports(
+                engineer=EngineerReport(
+                    report_id=uuid.uuid4(), machine_id=_mid_fb, generated_at=_now_fb,
+                    root_cause="manual inspection required",
+                    recommended_action=_SAFE_ACTION,
+                    risk_level=_rl_fb, confidence=_conf_fb,
+                    priority=MaintenancePriority.URGENT,
+                    estimated_repair_hours=0.0, parts_required=[],
+                    safety_notes=(
+                        "Evidence is insufficient to determine root cause. "
+                        "Perform manual inspection before repair actions."
+                    ),
+                ),
+                supervisor=SupervisorReport(
+                    report_id=uuid.uuid4(), machine_id=_mid_fb, generated_at=_now_fb,
+                    risk_level=_rl_fb, priority=MaintenancePriority.URGENT,
+                    recommended_action=_SAFE_ACTION,
+                    estimated_downtime_hours=0.0, affected_production_lines=[],
+                    resource_requirements=(
+                        "Verification: Pending. Escalate for manual inspection. "
+                        "Do not allocate major repair resources until diagnosis is confirmed."
+                    ),
+                ),
+                manager=ManagerReport(
+                    report_id=uuid.uuid4(), machine_id=_mid_fb, generated_at=_now_fb,
+                    risk_level=_rl_fb, root_cause="manual inspection required",
+                    business_impact=(
+                        "Verification: Preliminary assessment only. "
+                        "Business impact estimates are provisional until inspection "
+                        "confirms the root cause."
+                    ),
+                    estimated_cost_usd=0.0, recommended_action=_SAFE_ACTION,
+                    compliance_flags=[],
+                ),
+            )
+        else:
             rr.engineer.safety_notes = (
                 "Evidence is insufficient to determine root cause. "
                 "Perform manual inspection before repair actions."
             )
             rr.engineer.recommended_action = "Manual inspection before repair."
             rr.engineer.priority = MaintenancePriority.URGENT
-        if rr.supervisor:
-            rr.supervisor.resource_requirements = _sanitize_uncertain_text(
-                "Verification: Pending. "
-                "Escalate for manual inspection. Do not allocate major repair "
-                "resources until diagnosis is confirmed."
-            )
-            rr.supervisor.recommended_action = _SAFE_ACTION
-            rr.supervisor.priority = MaintenancePriority.URGENT
-        if rr.manager:
-            rr.manager.business_impact = _sanitize_uncertain_text(
-                "Verification: Preliminary assessment only. "
-                "Business impact estimates are provisional until inspection "
-                "confirms the root cause."
-            )
-            rr.manager.recommended_action = _SAFE_ACTION
+            if rr.supervisor:
+                rr.supervisor.resource_requirements = _sanitize_uncertain_text(
+                    "Verification: Pending. "
+                    "Escalate for manual inspection. Do not allocate major repair "
+                    "resources until diagnosis is confirmed."
+                )
+                rr.supervisor.recommended_action = _SAFE_ACTION
+                rr.supervisor.priority = MaintenancePriority.URGENT
+            if rr.manager:
+                rr.manager.business_impact = _sanitize_uncertain_text(
+                    "Verification: Preliminary assessment only. "
+                    "Business impact estimates are provisional until inspection "
+                    "confirms the root cause."
+                )
+                rr.manager.recommended_action = _SAFE_ACTION
         pending["role_reports"] = rr
 
     elif disposition == ReportDisposition.CAUTIOUS:
@@ -740,6 +1081,10 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
         "uncertainty_reason": _telemetry.get("uncertainty_reason"),
         "circuit_breaker_state": _telemetry.get("circuit_breaker_state"),
         "final_report_status": _telemetry.get("final_report_status"),
+        # Explainability & procurement gap intelligence
+        "evidence_chain": _telemetry.get("evidence_chain"),
+        "explainability_score": _telemetry.get("explainability_score"),
+        "procurement_gap": _telemetry.get("procurement_gap"),
     }
 
     trace = build_trace("finalize", start, now_utc(), "success")
@@ -762,16 +1107,16 @@ def build_graph() -> Any:
     """
     graph = StateGraph(VulcanOpsState)
 
-    graph.add_node("anomaly_agent",                 _anomaly_node)
-    graph.add_node("prognostics_agent",             _prognostics_node)
-    graph.add_node("evidence_retrieval_agent",      _evidence_retrieval_node)
-    graph.add_node("diagnosis_agent",               _diagnosis_node)
-    graph.add_node("evidence_verification_agent",   _evidence_verification_node)
-    graph.add_node("operational_impact_agent",      _operational_impact_node)
-    graph.add_node("maintenance_strategy_agent",    _maintenance_strategy_node)
-    graph.add_node("plant_priority_agent",          _plant_priority_node)
-    graph.add_node("communication_agent",           _communication_node)
-    graph.add_node("finalize_report",               _finalize_node)
+    graph.add_node("anomaly_agent",                 _trace_node("anomaly_agent", _anomaly_node))
+    graph.add_node("prognostics_agent",             _trace_node("prognostics_agent", _prognostics_node))
+    graph.add_node("evidence_retrieval_agent",      _trace_node("evidence_retrieval_agent", _evidence_retrieval_node))
+    graph.add_node("diagnosis_agent",               _trace_node("diagnosis_agent", _diagnosis_node))
+    graph.add_node("evidence_verification_agent",   _trace_node("evidence_verification_agent", _evidence_verification_node))
+    graph.add_node("operational_impact_agent",      _trace_node("operational_impact_agent", _operational_impact_node))
+    graph.add_node("maintenance_strategy_agent",    _trace_node("maintenance_strategy_agent", _maintenance_strategy_node))
+    graph.add_node("plant_priority_agent",          _trace_node("priority_engine", _plant_priority_node))
+    graph.add_node("communication_agent",           _trace_node("communication_agent", _communication_node))
+    graph.add_node("finalize_report",               _trace_node("finalize_report", _finalize_node))
 
     graph.add_edge(START,                            "anomaly_agent")
     graph.add_edge("anomaly_agent",                 "prognostics_agent")

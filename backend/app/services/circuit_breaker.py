@@ -10,7 +10,7 @@ No external dependencies. Supports three states:
 Configuration:
     MAX_FAILURES     = 3
     COOLDOWN_SECONDS = 60
-    TIMEOUT_SECONDS  = 10
+    TIMEOUT_SECONDS  = 45
 """
 
 import asyncio
@@ -42,7 +42,7 @@ class CircuitBreaker:
 
     MAX_FAILURES = 3
     COOLDOWN_SECONDS = 60
-    TIMEOUT_SECONDS = 10
+    TIMEOUT_SECONDS = 45
 
     def __init__(self) -> None:
         self.state = CircuitBreakerState.CLOSED

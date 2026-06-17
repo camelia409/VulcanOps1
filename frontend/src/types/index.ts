@@ -49,6 +49,28 @@ export interface ReportData {
   pipeline_errors: number;
   has_errors: boolean;
   error?: string;
+  evidence_chain?: EvidenceChainItem[];
+  explainability_score?: number | null;
+  procurement_gap?: ProcurementGapInfo | null;
+}
+
+export interface EvidenceChainItem {
+  step: number;
+  type: "sensor" | "history" | "manual";
+  source: string;
+  evidence: string;
+}
+
+export interface ProcurementGapInfo {
+  procurement_gap: boolean;
+  rul_days?: number | null;
+  at_risk_parts?: {
+    part: string;
+    lead_time_days: number;
+    rul_days: number;
+    gap_days: number;
+  }[];
+  recommended_action?: string;
 }
 
 export interface PlantOverview {
@@ -172,6 +194,20 @@ export interface ReportBatch {
 export interface StoredRoleReport {
   role: "engineer" | "supervisor" | "manager";
   content: string;
+}
+
+export interface DeepAnalysisJob {
+  job_id: string;
+  status: "queued" | "running" | "done" | "failed";
+  current_stage: string | null;
+  progress_percent: number;
+  machine_id: string;
+  batch_id: string | null;
+  error_message: string | null;
+  queued_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_ms: number | null;
 }
 
 export interface IngestResponse {

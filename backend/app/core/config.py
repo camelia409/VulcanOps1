@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "google/gemini-2.5-flash"
     LLM_TIMEOUT: float = 20.0
 
+    # Hard ceiling for the synchronous deep-analysis endpoint. If the pipeline
+    # does not finish within this window it is aborted and the batch is marked
+    # failed so the UI never stays in "running" forever.
+    DEEP_ANALYSIS_TIMEOUT_SECONDS: float = 90.0
+
     @property
     def database_url(self) -> str:
         return self._parse_database_url()[0]

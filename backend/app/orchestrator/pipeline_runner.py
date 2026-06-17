@@ -14,7 +14,11 @@ Responsibilities:
 Does NOT write to the database. Callers persist the report if required.
 """
 
+import json
+import logging
+import time
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from sqlalchemy import select, desc
@@ -24,13 +28,30 @@ from app.core.state_contract import VulcanOpsState
 from app.models.machine import Machine
 from app.models.maintenance_record import MaintenanceRecord
 from app.models.sensor_reading import SensorReading
-from app.orchestrator.graph_builder import get_graph
+from app.orchestrator.graph_builder import _progress_callback_ctx, get_graph
 from app.schemas.machine import MachineSchema
 from app.schemas.maintenance_record import MaintenanceRecordSchema
 from app.schemas.sensor_reading import SensorReadingSchema
 
+logger = logging.getLogger(__name__)
+_PIPELINE_LOG = logging.getLogger("vulcanops.pipeline")
+
 # Number of most-recent sensor readings loaded into the pipeline
 _SENSOR_WINDOW = 200
+
+
+def _log_step(event: str, machine_id: str, step: str, status: str, duration_ms: float | None = None, error: str | None = None) -> None:
+    payload: dict[str, Any] = {
+        "event": event,
+        "machine_id": machine_id,
+        "step": step,
+        "status": status,
+    }
+    if duration_ms is not None:
+        payload["duration_ms"] = round(duration_ms, 1)
+    if error is not None:
+        payload["error"] = error
+    _PIPELINE_LOG.info(json.dumps(payload))
 
 
 class PipelineError(Exception):
@@ -74,13 +95,20 @@ async def _load_maintenance_history(
     return [MaintenanceRecordSchema.model_validate(r) for r in rows]
 
 
-async def run_pipeline(machine_id: str, db: AsyncSession) -> VulcanOpsState:
+async def run_pipeline(
+    machine_id: str,
+    db: AsyncSession,
+    *,
+    progress_callback: Callable[[str], Awaitable[None]] | None = None,
+) -> VulcanOpsState:
     """
     Execute the full VulcanOps agent pipeline for a given machine.
 
     Args:
-        machine_id: UUID string of the target machine.
-        db:         Active async SQLAlchemy session.
+        machine_id:        UUID string of the target machine.
+        db:                Active async SQLAlchemy session.
+        progress_callback: Optional async callable(stage_name) that receives
+                           the name of each graph node as it begins.
 
     Returns:
         VulcanOpsState with all agent outputs populated.
@@ -94,9 +122,21 @@ async def run_pipeline(machine_id: str, db: AsyncSession) -> VulcanOpsState:
     except ValueError:
         raise ValueError(f"Invalid machine_id format: '{machine_id}'")
 
-    machine_context    = await _load_machine(mid, db)
-    sensor_readings    = await _load_sensor_readings(mid, db)
+    machine_id_str = str(mid)
+    _log_step("deep_analysis", machine_id_str, "load_machine", "start")
+    t0 = time.monotonic()
+    machine_context = await _load_machine(mid, db)
+    _log_step("deep_analysis", machine_id_str, "load_machine", "end", duration_ms=(time.monotonic() - t0) * 1000)
+
+    _log_step("deep_analysis", machine_id_str, "load_sensor_data", "start")
+    t0 = time.monotonic()
+    sensor_readings = await _load_sensor_readings(mid, db)
+    _log_step("deep_analysis", machine_id_str, "load_sensor_data", "end", duration_ms=(time.monotonic() - t0) * 1000)
+
+    _log_step("deep_analysis", machine_id_str, "load_maintenance", "start")
+    t0 = time.monotonic()
     maintenance_history = await _load_maintenance_history(mid, db)
+    _log_step("deep_analysis", machine_id_str, "load_maintenance", "end", duration_ms=(time.monotonic() - t0) * 1000)
 
     initial_state = VulcanOpsState(
         active_machine_id=mid,
@@ -107,9 +147,21 @@ async def run_pipeline(machine_id: str, db: AsyncSession) -> VulcanOpsState:
 
     graph = get_graph()
 
-    # LangGraph returns either a dict or the Pydantic model depending on version;
-    # normalise to VulcanOpsState either way.
-    raw_result: Any = await graph.ainvoke(initial_state)
+    _log_step("deep_analysis", machine_id_str, "agent_graph", "start")
+    t0 = time.monotonic()
+
+    # Inject the optional progress callback into the graph node context so
+    # each agent stage can report its start without touching VulcanOpsState.
+    progress_token = _progress_callback_ctx.set(progress_callback)
+    try:
+        # LangGraph returns either a dict or the Pydantic model depending on version;
+        # normalise to VulcanOpsState either way.
+        raw_result: Any = await graph.ainvoke(initial_state)
+    finally:
+        _progress_callback_ctx.reset(progress_token)
+
+    graph_ms = (time.monotonic() - t0) * 1000
+    _log_step("deep_analysis", machine_id_str, "agent_graph", "end", duration_ms=graph_ms)
 
     if isinstance(raw_result, VulcanOpsState):
         return raw_result

@@ -32,6 +32,7 @@ from app.db.base import Base
 # Import all models to register them with Base.metadata before create_all()
 from app.models import (
     ChatMessage,
+    DeepAnalysisJob,
     IngestedFile,
     IngestionEvent,
     Machine,

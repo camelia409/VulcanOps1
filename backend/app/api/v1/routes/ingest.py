@@ -200,10 +200,14 @@ async def ingest_files(
             detail="No files provided",
         )
 
-    # Create the ingestion event up front so the client has an event_id.
+    # Commit the event immediately so per-file rollbacks cannot lose it.
+    # Without an early commit, a per-file db.rollback() would wipe the event
+    # row and the next file's create_ingested_file would hit a FK violation.
     event = IngestionEvent(status="running")
     db.add(event)
-    await db.flush()
+    await db.commit()
+    await db.refresh(event)
+    event_id = event.event_id
 
     file_summaries: list[dict] = []
     errors: list[str] = []
@@ -243,20 +247,26 @@ async def ingest_files(
             )
             continue
 
-        # Create the per-file tracking record before processing.
+        # Create and immediately commit the per-file tracking record.
+        # Committing here ensures file_record survives any per-file db.rollback().
         file_record = await create_ingested_file(
             db,
-            ingestion_event_id=event.event_id,
+            ingestion_event_id=event_id,
             original_filename=filename,
             file_type=file_type,
         )
+        await db.commit()
+        file_id = file_record.file_id
 
         try:
-            result = await _route_file(file_type, content, filename, db, file_record.file_id)
-
+            # _route_file calls the ingestion service which handles its own
+            # commits and calls update_ingested_file internally.
+            # Do NOT commit again here — it would double-commit and close the
+            # transaction context that the service left in a clean state.
+            result = await _route_file(file_type, content, filename, db, file_id)
             file_summaries.append(
                 {
-                    "file_id": str(file_record.file_id),
+                    "file_id": str(file_id),
                     "name": filename,
                     "type": file_type,
                     "rows": result.rows_processed or 0,
@@ -269,10 +279,17 @@ async def ingest_files(
         except HTTPException:
             raise
         except Exception as exc:
+            # Service raised an unhandled exception. Roll back any uncommitted
+            # writes from that service. event and file_record were committed
+            # before _route_file was called so they survive the rollback.
+            try:
+                await db.rollback()
+            except Exception:
+                pass
             errors.append(f"'{filename}': {exc}")
             file_summaries.append(
                 {
-                    "file_id": str(file_record.file_id),
+                    "file_id": str(file_id),
                     "name": filename,
                     "type": file_type,
                     "rows": 0,
@@ -280,14 +297,9 @@ async def ingest_files(
                     "errors": [str(exc)],
                 }
             )
-            # The session may contain invalid pending changes from the failed
-            # ingestion (e.g. bad enum values). Roll back before updating the
-            # tracking record so we don't hit PendingRollbackError.
-            await db.rollback()
-            # Mark the file record as failed.
             await update_ingested_file(
                 db,
-                file_record.file_id,
+                file_id,
                 status="error",
                 error_count=1,
                 errors=[str(exc)],
@@ -296,6 +308,12 @@ async def ingest_files(
     # Discover all machines now present in the registry.
     machine_result = await db.execute(select(Machine.machine_id))
     machine_ids: list[uuid.UUID] = list(machine_result.scalars().all())
+
+    # Re-fetch event — the object may be expired after multiple per-file commits.
+    from sqlalchemy import select as sa_select
+    from app.models.ingestion_event import IngestionEvent as _IE
+    ev_result = await db.execute(sa_select(_IE).where(_IE.event_id == event_id))
+    event = ev_result.scalar_one()
 
     event.files_uploaded = file_summaries
     event.machines_found = len(machine_ids)
@@ -306,14 +324,14 @@ async def ingest_files(
     # Trigger background processing for every machine.
     background_tasks.add_task(
         run_autonomous_pipeline,
-        event_id=event.event_id,
+        event_id=event_id,
         machine_ids=machine_ids,
     )
 
     return {
-        "event_id": str(event.event_id),
-        "status": event.status,
-        "machines_found": event.machines_found,
+        "event_id": str(event_id),
+        "status": "processing",
+        "machines_found": len(machine_ids),
         "files": file_summaries,
         "errors": errors if errors else None,
     }

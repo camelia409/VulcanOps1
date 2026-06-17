@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
-import type { ReportBatch, ReportData, Role, StoredRoleReport } from "../../types";
-import { getBatch, getRoleReport, getRolePdfUrl, runDeepAnalysis } from "../../api/reportsApi";
+import { useEffect, useRef, useState } from "react";
+import type { EvidenceChainItem, ProcurementGapInfo, ReportBatch, ReportData, Role, StoredRoleReport } from "../../types";
+import { getBatch, getDeepAnalysisJob, getRoleReport, getRolePdfUrl, runDeepAnalysis } from "../../api/reportsApi";
 import { COLORS, PRIORITY_COLORS } from "../../theme";
 
 interface Props {
@@ -12,6 +12,9 @@ interface Props {
 type ExtendedReport = ReportData & {
   deep_analysis_status?: "done" | "queued";
   risk_score?: number;
+  evidence_chain?: EvidenceChainItem[];
+  explainability_score?: number | null;
+  procurement_gap?: ProcurementGapInfo | null;
 };
 
 const ROLE_LABELS: Record<Role, string> = {
@@ -153,6 +156,110 @@ const S = {
     background: COLORS.failedBg,
     borderRadius: "8px",
     marginBottom: "12px",
+  },
+
+  // ── explainability card ──
+  explainCard: {
+    background: COLORS.inputBg,
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: "10px",
+    marginBottom: "14px",
+    overflow: "hidden" as const,
+  },
+  explainHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: "12px 14px",
+    cursor: "pointer",
+    background: "#f9fafb",
+  },
+  explainTitle: {
+    fontSize: "13px",
+    fontWeight: 700,
+    color: COLORS.text,
+  },
+  explainScore: {
+    fontSize: "11px",
+    fontWeight: 700,
+    color: COLORS.textMuted,
+    background: "#eef2ff",
+    padding: "2px 8px",
+    borderRadius: "10px",
+  },
+  explainBody: {
+    padding: "12px 14px",
+    borderTop: `1px solid ${COLORS.border}`,
+  },
+  explainStep: {
+    display: "flex",
+    gap: "10px",
+    marginBottom: "10px",
+    fontSize: "12px",
+    color: COLORS.textSecondary,
+    lineHeight: 1.5,
+  },
+  explainStepNum: {
+    flexShrink: 0,
+    width: "20px",
+    height: "20px",
+    borderRadius: "50%",
+    background: COLORS.accent,
+    color: "white",
+    fontSize: "11px",
+    fontWeight: 700,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  explainStepMeta: {
+    fontSize: "10px",
+    fontWeight: 700,
+    color: COLORS.textMuted,
+    textTransform: "uppercase" as const,
+    letterSpacing: "0.05em",
+    marginBottom: "2px",
+  },
+  evidenceSection: {
+    background: "#f9fafb",
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: "8px",
+    padding: "12px 14px",
+    marginBottom: "12px",
+  },
+  evidenceSectionTitle: {
+    fontSize: "12px",
+    fontWeight: 700,
+    color: COLORS.text,
+    marginBottom: "8px",
+  },
+  evidenceRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    fontSize: "12px",
+    color: COLORS.textSecondary,
+    marginBottom: "4px",
+  },
+  evidenceCheck: {
+    color: "#16a34a",
+    fontWeight: 700,
+    fontSize: "13px",
+  },
+  evidenceMissing: {
+    color: "#d1d5db",
+    fontWeight: 700,
+    fontSize: "13px",
+  },
+  procurementAlert: {
+    background: "#fef2f2",
+    border: "1px solid #fecaca",
+    borderRadius: "8px",
+    padding: "10px 12px",
+    fontSize: "12px",
+    color: "#991b1b",
+    lineHeight: 1.5,
+    marginTop: "8px",
   },
 
   // ── fast-only panel ──
@@ -310,6 +417,19 @@ function priorityColor(p: string | null | undefined): string {
   return c?.text ?? COLORS.textMuted;
 }
 
+function hasEvidenceType(chain: EvidenceChainItem[] | undefined, type: string): boolean {
+  return chain?.some((item) => item.type === type) ?? false;
+}
+
+function evidenceTypeLabel(type: string): string {
+  switch (type) {
+    case "sensor": return "Sensor data";
+    case "history": return "Maintenance history";
+    case "manual": return "Equipment manual";
+    default: return type;
+  }
+}
+
 // ── component ─────────────────────────────────────────────────────────────────
 
 export default function ReportViewer({ batchId, onDeepAnalysisComplete }: Props) {
@@ -322,6 +442,9 @@ export default function ReportViewer({ batchId, onDeepAnalysisComplete }: Props)
   const [roleError, setRoleError] = useState<string | null>(null);
   const [deepAnalyzing, setDeepAnalyzing] = useState(false);
   const [deepError, setDeepError] = useState<string | null>(null);
+  const [pollingJobId, setPollingJobId] = useState<string | null>(null);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [explainExpanded, setExplainExpanded] = useState(false);
 
   // ── fetch batch on batchId change ──
   useEffect(() => {
@@ -331,6 +454,11 @@ export default function ReportViewer({ batchId, onDeepAnalysisComplete }: Props)
     setRoleError(null);
     setDeepError(null);
     setDeepAnalyzing(false);
+    setPollingJobId(null);
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
 
     if (!batchId) return;
     let cancelled = false;
@@ -343,6 +471,52 @@ export default function ReportViewer({ batchId, onDeepAnalysisComplete }: Props)
 
     return () => { cancelled = true; };
   }, [batchId]);
+
+  // ── poll deep-analysis job until done/failed ──
+  useEffect(() => {
+    if (!pollingJobId) return;
+
+    setDeepAnalyzing(true);
+    setDeepError(null);
+
+    const finish = () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+      setPollingJobId(null);
+      setDeepAnalyzing(false);
+    };
+
+    const poll = async () => {
+      try {
+        const job = await getDeepAnalysisJob(pollingJobId);
+        if (job.status === "done" && job.batch_id) {
+          finish();
+          onDeepAnalysisComplete?.(job.batch_id);
+          const refreshed = await getBatch(job.batch_id);
+          setBatch(refreshed);
+        } else if (job.status === "failed") {
+          finish();
+          setDeepError(job.error_message || "Deep analysis failed");
+        }
+        // queued/running: keep polling
+      } catch (err) {
+        finish();
+        setDeepError(err instanceof Error ? err.message : "Polling failed");
+      }
+    };
+
+    poll();
+    pollIntervalRef.current = setInterval(poll, 2000);
+
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+    };
+  }, [pollingJobId]);
 
   // ── fetch role report (full-AI only, re-runs on role change) ──
   useEffect(() => {
@@ -365,12 +539,12 @@ export default function ReportViewer({ batchId, onDeepAnalysisComplete }: Props)
 
   // ── deep analysis trigger ──
   const handleRunDeepAnalysis = async () => {
-    if (!batch || deepAnalyzing) return;
-    setDeepAnalyzing(true);
+    if (!batch || deepAnalyzing || pollingJobId) return;
     setDeepError(null);
+    setDeepAnalyzing(true);
     try {
       const result = await runDeepAnalysis(batch.machine_id);
-      onDeepAnalysisComplete?.(result.batch_id);
+      setPollingJobId(result.job_id);
     } catch (err) {
       setDeepError(err instanceof Error ? err.message : "Deep analysis failed");
       setDeepAnalyzing(false);
@@ -622,6 +796,47 @@ export default function ReportViewer({ batchId, onDeepAnalysisComplete }: Props)
               </div>
             )}
 
+            {/* explainability card */}
+            {report?.evidence_chain && report.evidence_chain.length > 0 && (
+              <div style={S.explainCard}>
+                <div
+                  style={S.explainHeader}
+                  onClick={() => setExplainExpanded((v) => !v)}
+                  role="button"
+                  aria-expanded={explainExpanded}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <span style={S.explainTitle}>Explainability</span>
+                    {report.explainability_score != null && (
+                      <span style={S.explainScore}>{report.explainability_score}/100</span>
+                    )}
+                  </div>
+                  <span style={{ fontSize: "12px", color: COLORS.textMuted }}>
+                    {explainExpanded ? "▲" : "▼"} View evidence chain
+                  </span>
+                </div>
+                {explainExpanded && (
+                  <div style={S.explainBody}>
+                    {report.evidence_chain.map((item) => (
+                      <div key={item.step} style={S.explainStep}>
+                        <div style={S.explainStepNum}>{item.step}</div>
+                        <div>
+                          <div style={S.explainStepMeta}>{evidenceTypeLabel(item.type)} · {item.source}</div>
+                          <div>{item.evidence}</div>
+                        </div>
+                      </div>
+                    ))}
+                    {report.procurement_gap?.procurement_gap && (
+                      <div style={S.procurementAlert}>
+                        <strong>Procurement gap detected:</strong>{" "}
+                        {report.procurement_gap.recommended_action}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* role error */}
             {roleError && (
               <div style={S.roleError}>
@@ -633,6 +848,59 @@ export default function ReportViewer({ batchId, onDeepAnalysisComplete }: Props)
             {roleLoading && !roleReport && (
               <div style={{ color: COLORS.textMuted, fontSize: "13px", marginBottom: "12px" }}>
                 Loading {activeRole} report…
+              </div>
+            )}
+
+            {/* role-specific evidence / assurance header */}
+            {roleReport && report?.evidence_chain && report.evidence_chain.length > 0 && (
+              <div style={S.evidenceSection}>
+                {activeRole === "engineer" && (
+                  <>
+                    <div style={S.evidenceSectionTitle}>Evidence Sources</div>
+                    {["sensor", "history", "manual"].map((type) => {
+                      const ok = hasEvidenceType(report.evidence_chain, type);
+                      return (
+                        <div key={type} style={S.evidenceRow}>
+                          <span style={ok ? S.evidenceCheck : S.evidenceMissing}>{ok ? "✓" : "✗"}</span>
+                          <span>{evidenceTypeLabel(type)}</span>
+                        </div>
+                      );
+                    })}
+                  </>
+                )}
+                {activeRole === "supervisor" && (
+                  <>
+                    <div style={S.evidenceSectionTitle}>Decision Confidence</div>
+                    <div style={S.evidenceRow}>
+                      <span style={S.evidenceCheck}>✓</span>
+                      <span>Explainability Score: {report.explainability_score ?? "—"}/100</span>
+                    </div>
+                    <div style={S.evidenceRow}>
+                      <span style={S.evidenceCheck}>✓</span>
+                      <span>Evidence Sources: {report.evidence_chain.length}</span>
+                    </div>
+                  </>
+                )}
+                {activeRole === "manager" && (
+                  <>
+                    <div style={S.evidenceSectionTitle}>Business Assurance</div>
+                    <div style={S.evidenceRow}>
+                      <span style={S.evidenceCheck}>✓</span>
+                      <span>Decision traceability: {report.explainability_score != null && report.explainability_score >= 70 ? "High" : "Moderate"}</span>
+                    </div>
+                    <div style={S.evidenceRow}>
+                      <span style={report.procurement_gap?.procurement_gap ? S.evidenceCheck : S.evidenceMissing}>
+                        {report.procurement_gap?.procurement_gap ? "✓" : "✗"}
+                      </span>
+                      <span>Procurement Gap: {report.procurement_gap?.procurement_gap ? "Detected" : "None"}</span>
+                    </div>
+                    {report.procurement_gap?.procurement_gap && (
+                      <div style={S.procurementAlert}>
+                        {report.procurement_gap.recommended_action}
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
             )}
 

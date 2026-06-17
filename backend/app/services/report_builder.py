@@ -125,6 +125,10 @@ def build_single_report(state: VulcanOpsState) -> dict[str, Any]:
         "uncertainty_reason":   telemetry.get("uncertainty_reason"),
         "final_report_status":  telemetry.get("final_report_status"),
         "circuit_breaker_state": telemetry.get("circuit_breaker_state"),
+        # Explainability & procurement gap intelligence
+        "evidence_chain": telemetry.get("evidence_chain"),
+        "explainability_score": telemetry.get("explainability_score"),
+        "procurement_gap": telemetry.get("procurement_gap"),
     }
 
 

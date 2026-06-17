@@ -5,10 +5,12 @@ All endpoints operate on the tables created by the ingestion event flow:
 `ingestion_events`, `report_batches`, and `stored_role_reports`.
 """
 
+import json
+import logging
 import uuid
 from datetime import date, datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -18,9 +20,14 @@ from app.models.ingestion_event import IngestionEvent
 from app.models.machine import Machine
 from app.models.report_batch import ReportBatch
 from app.models.stored_role_report import StoredRoleReport
+from app.services.deep_analysis_execution_service import execute_deep_analysis_job
+from app.services import deep_analysis_job_service
 from app.services.pdf_service import generate_pdf_from_batch
 
 router = APIRouter(prefix="/reports", tags=["reports"])
+
+logger = logging.getLogger(__name__)
+_PIPELINE_LOG = logging.getLogger("vulcanops.pipeline")
 
 _DEFAULT_PAGE_SIZE = 20
 _MAX_PAGE_SIZE = 100
@@ -168,25 +175,19 @@ async def get_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> 
 @router.post("/deep-analyze/{machine_id}")
 async def run_deep_analysis(
     machine_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """
-    Run the full AI pipeline for one machine and persist the result.
+    Enqueue a full deep-analysis job for one machine and return immediately.
 
-    If a batch already exists for this machine (fast-only or previous deep run),
-    it is updated in place. Role reports are regenerated from the new pipeline output.
-
-    This endpoint is intentionally synchronous — the pipeline takes 20-40 seconds.
-    The frontend shows a loading state while waiting.
+    The actual multi-agent pipeline runs as a BackgroundTask. Use
+    GET /reports/jobs/{job_id} to poll for status and progress.
     """
-    from app.orchestrator.pipeline_runner import PipelineError, run_pipeline
-    from app.services import report_builder
-
     # Find the most recent batch for this machine so we can reuse its event_id.
     existing_result = await db.execute(
         select(ReportBatch)
         .where(ReportBatch.machine_id == machine_id)
-        .options(selectinload(ReportBatch.role_reports))
         .order_by(ReportBatch.generated_at.desc())
         .limit(1)
     )
@@ -206,57 +207,41 @@ async def run_deep_analysis(
             )
         event_id = ev.event_id
 
-    try:
-        state = await run_pipeline(str(machine_id), db)
-    except PipelineError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Pipeline failed: {exc}",
-        )
-
-    report = report_builder.build_single_report(state)
-    report["deep_analysis_status"] = "done"
-
-    if existing:
-        # Update the existing batch in place (UniqueConstraint prevents a second row).
-        existing.root_cause = report.get("root_cause")
-        existing.failure_mode = report.get("failure_mode")
-        existing.confidence = report.get("diagnosis_confidence")
-        existing.risk_level = report.get("risk_level")
-        existing.recommended_action = report.get("recommended_action")
-        existing.priority = report.get("priority")
-        existing.rul_hours = report.get("rul_hours")
-        existing.verification_passed = (report.get("verification") or {}).get("verified")
-        existing.pipeline_errors = report.get("pipeline_errors", 0)
-        existing.full_report_json = report
-
-        # Replace role reports.
-        for rr in list(existing.role_reports):
-            await db.delete(rr)
-        await db.flush()
-
-        for role in ("engineer", "supervisor", "manager"):
-            db.add(
-                StoredRoleReport(
-                    batch_id=existing.batch_id,
-                    role=role,
-                    content=report.get(f"{role}_report") or "",
-                )
-            )
-        await db.commit()
-        return_id = existing.batch_id
-    else:
-        from app.services.report_persistence_service import persist_batch
-        new_batch = await persist_batch(event_id, state, report, db)
-        return_id = new_batch.batch_id
+    job = await deep_analysis_job_service.create_job(machine_id, event_id, db)
+    background_tasks.add_task(
+        execute_deep_analysis_job, job.job_id, machine_id, event_id
+    )
 
     return {
-        "batch_id": str(return_id),
-        "machine_id": str(machine_id),
-        "deep_analysis_status": "done",
-        "message": "Deep analysis complete.",
+        "job_id": str(job.job_id),
+        "status": "queued",
+    }
+
+
+@router.get("/jobs/{job_id}")
+async def get_deep_analysis_job(
+    job_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return the status and progress of a deep-analysis job."""
+    job = await deep_analysis_job_service.get_job(job_id, db)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Job not found"
+        )
+
+    return {
+        "job_id": str(job.job_id),
+        "status": job.status,
+        "current_stage": job.current_stage,
+        "progress_percent": job.progress_percent,
+        "machine_id": str(job.machine_id),
+        "batch_id": str(job.batch_id) if job.batch_id else None,
+        "error_message": job.error_message,
+        "queued_at": job.queued_at.isoformat() if job.queued_at else None,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        "duration_ms": job.duration_ms,
     }
 
 

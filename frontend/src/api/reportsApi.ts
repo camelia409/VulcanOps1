@@ -1,10 +1,15 @@
 import { API_BASE_URL } from "../config";
 import type {
+  DeepAnalysisJob,
   EventListResponse,
   IngestionEvent,
   ReportBatch,
   StoredRoleReport,
 } from "../types";
+
+async function parseErrorBody(res: Response): Promise<{ detail?: string }> {
+  return res.json().catch(() => ({}));
+}
 
 export async function listEvents(
   skip = 0,
@@ -12,7 +17,7 @@ export async function listEvents(
 ): Promise<EventListResponse> {
   const res = await fetch(`${API_BASE_URL}/api/v1/reports?skip=${skip}&limit=${limit}`);
   if (!res.ok) {
-    const data = await res.json();
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
   return (await res.json()) as EventListResponse;
@@ -24,7 +29,7 @@ export async function listTodaysEvents(): Promise<{
 }> {
   const res = await fetch(`${API_BASE_URL}/api/v1/reports/today`);
   if (!res.ok) {
-    const data = await res.json();
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
   return (await res.json()) as { date: string; items: IngestionEvent[] };
@@ -33,7 +38,7 @@ export async function listTodaysEvents(): Promise<{
 export async function getEvent(eventId: string): Promise<IngestionEvent> {
   const res = await fetch(`${API_BASE_URL}/api/v1/reports/event/${eventId}`);
   if (!res.ok) {
-    const data = await res.json();
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
   return (await res.json()) as IngestionEvent;
@@ -44,7 +49,7 @@ export async function deleteEvent(eventId: string): Promise<void> {
     method: "DELETE",
   });
   if (!res.ok) {
-    const data = await res.json();
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
 }
@@ -52,7 +57,7 @@ export async function deleteEvent(eventId: string): Promise<void> {
 export async function getBatch(batchId: string): Promise<ReportBatch> {
   const res = await fetch(`${API_BASE_URL}/api/v1/reports/batch/${batchId}`);
   if (!res.ok) {
-    const data = await res.json();
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
   return (await res.json()) as ReportBatch;
@@ -64,7 +69,7 @@ export async function getRoleReport(
 ): Promise<StoredRoleReport> {
   const res = await fetch(`${API_BASE_URL}/api/v1/reports/batch/${batchId}/${role}`);
   if (!res.ok) {
-    const data = await res.json();
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
   return (await res.json()) as StoredRoleReport;
@@ -77,20 +82,27 @@ export function getRolePdfUrl(
   return `${API_BASE_URL}/api/v1/reports/batch/${batchId}/pdf?role=${role}`;
 }
 
-export interface DeepAnalysisResult {
-  batch_id: string;
-  machine_id: string;
-  deep_analysis_status: "done";
-  message: string;
+export interface DeepAnalysisEnqueueResult {
+  job_id: string;
+  status: "queued";
 }
 
-export async function runDeepAnalysis(machineId: string): Promise<DeepAnalysisResult> {
+export async function runDeepAnalysis(machineId: string): Promise<DeepAnalysisEnqueueResult> {
   const res = await fetch(`${API_BASE_URL}/api/v1/reports/deep-analyze/${machineId}`, {
     method: "POST",
   });
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
-  return (await res.json()) as DeepAnalysisResult;
+  return (await res.json()) as DeepAnalysisEnqueueResult;
+}
+
+export async function getDeepAnalysisJob(jobId: string): Promise<DeepAnalysisJob> {
+  const res = await fetch(`${API_BASE_URL}/api/v1/reports/jobs/${jobId}`);
+  if (!res.ok) {
+    const data = await parseErrorBody(res);
+    throw new Error(data.detail ?? `Server error ${res.status}`);
+  }
+  return (await res.json()) as DeepAnalysisJob;
 }

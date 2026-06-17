@@ -1,4 +1,6 @@
 from app.models.chat_message import ChatMessage
+from app.models.document_chunk import DocumentChunk
+from app.models.deep_analysis_job import DeepAnalysisJob
 from app.models.ingested_file import IngestedFile
 from app.models.ingestion_event import IngestionEvent
 from app.models.machine import Machine
@@ -9,6 +11,8 @@ from app.models.stored_role_report import StoredRoleReport
 
 __all__ = [
     "ChatMessage",
+    "DocumentChunk",
+    "DeepAnalysisJob",
     "IngestedFile",
     "IngestionEvent",
     "Machine",

@@ -37,5 +37,9 @@ reportlab==4.2.5
 # LLM — OpenRouter via OpenAI-compatible SDK
 openai==1.58.1
 
+# Vector search — pgvector + local embeddings (no external API key needed)
+pgvector==0.4.2
+fastembed==0.8.0
+
 # HTTP client
 httpx==0.28.1

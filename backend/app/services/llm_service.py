@@ -34,9 +34,12 @@ _PIPELINE_LOG = logging.getLogger("vulcanops.pipeline")
 _LLM_CACHE: OrderedDict[str, tuple[dict[str, Any], dict[str, Any]]] = OrderedDict()
 _LLM_CACHE_MAX = 500
 
+# Bump this whenever prompts change so stale cache entries are never returned.
+_PROMPT_SCHEMA_VERSION = "v3"
+
 
 def _prompt_cache_key(model: str, system_prompt: str, user_prompt: str) -> str:
-    raw = f"{model}||{system_prompt}||{user_prompt}"
+    raw = f"{_PROMPT_SCHEMA_VERSION}||{model}||{system_prompt}||{user_prompt}"
     return hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()
 
 
@@ -49,10 +52,12 @@ def llm_cache_stats() -> dict[str, int]:
 _DIAGNOSIS_FALLBACK: dict[str, Any] = {
     "root_cause": "manual inspection required",
     "failure_mode": "insufficient evidence",
-    "reasoning": "LLM unavailable — circuit breaker open. Analysis based on deterministic sensor thresholds only.",
+    "reasoning": "LLM service unavailable. Analysis based on deterministic sensor thresholds only.",
     "confidence": 0.2,
     "evidence_used": [],
 }
+
+_REASONING_UNAVAILABLE = "Reasoning not provided by model. See sensor anomaly data and evidence above."
 
 _CIRCUIT_BREAKER_COMMUNICATION_MESSAGE = (
     "Evidence is insufficient to determine root cause. "
@@ -102,20 +107,23 @@ _DIAGNOSIS_SYSTEM = (
     "Respond ONLY with valid JSON. No prose, no markdown fences, no explanation outside the JSON object.\n"
     'Required schema: {"root_cause":"<string>","failure_mode":"<string>",'
     '"reasoning":"<string>","confidence":<float 0.0-1.0>,"evidence_used":["<string>",...]}\n\n'
-    "EVIDENCE GROUNDING RULES — read carefully before responding:\n"
-    "You may ONLY use evidence explicitly present in this request: sensor readings, "
-    "maintenance history, manuals, and SOPs provided below.\n"
-    "CRITICAL: Never invent failures. Never infer from general mechanical knowledge. "
-    "Never guess a component failure that is not directly supported by the provided data.\n\n"
-    "CONFIDENCE SCALE:\n"
-    "- 0.70–0.89: Cautious diagnosis — evidence suggests a likely cause but is not definitive. "
-    "Use precise industrial language and note what is uncertain.\n"
-    "- 0.50–0.69: Preliminary diagnosis — some evidence points to a possible cause, but the signal is mixed. "
-    "State the most likely cause and the gaps that need confirmation.\n"
-    "- < 0.50: Insufficient evidence — set root_cause='manual inspection required', "
-    "failure_mode='insufficient evidence', and explain what data is missing.\n\n"
-    "When evidence is moderate or stronger, produce a concrete, actionable diagnosis with specific component or system names found in the data. "
-    "Do NOT default to generic fallback text when the evidence supports a real diagnosis."
+    "EVIDENCE GROUNDING RULES:\n"
+    "Use ONLY evidence explicitly present in this request: sensor readings, maintenance history, "
+    "manuals, and SOPs provided below.\n"
+    "Never invent failures. Evidence that SUGGESTS a cause is sufficient to name it — "
+    "you do not need proof beyond reasonable doubt.\n\n"
+    "CONFIDENCE SCALE (rate your diagnosis, do NOT suppress it):\n"
+    "- 0.70–1.0: High confidence — evidence is consistent and points clearly to a cause. "
+    "Name the specific component or system.\n"
+    "- 0.50–0.69: Cautious diagnosis — evidence suggests a likely cause but has gaps. "
+    "Name the most probable cause and note what is unconfirmed.\n"
+    "- 0.25–0.49: Preliminary hypothesis — signal is mixed or indirect. "
+    "State the best hypothesis given available data and list what additional checks would confirm it.\n"
+    "- < 0.25: Evidence is genuinely absent. Only then use root_cause='manual inspection required'.\n\n"
+    "CRITICAL RULE: Always provide your most specific defensible diagnosis, regardless of confidence. "
+    "The downstream system will label it 'cautious' or 'preliminary' — your job is to give the "
+    "most actionable answer the evidence supports, never to self-censor. "
+    "A specific hypothesis at 0.40 confidence is far more useful than 'manual inspection required'."
     + _JSON_RULES
 )
 
@@ -340,10 +348,11 @@ class OpenRouterLLMService:
                 "cache_hit": False,
             }
         except Exception as exc:
-            logger.warning("OpenRouter error: %s", exc)
+            error_msg = str(exc) or f"{type(exc).__name__} (no message)"
+            logger.warning("OpenRouter error: %s", error_msg)
             _PIPELINE_LOG.warning(json.dumps({
                 "event": "llm_error",
-                "error": str(exc),
+                "error": error_msg,
                 "model": model,
             }))
             return fallback, {**_FALLBACK_TELEMETRY, "error": str(exc), "cache_hit": False}
@@ -403,8 +412,8 @@ class OpenRouterLLMService:
         confidence = max(0.0, min(1.0, confidence))
 
         root_cause   = raw.get("root_cause")   or _DIAGNOSIS_FALLBACK["root_cause"]
-        failure_mode = raw.get("failure_mode") or _DIAGNOSIS_FALLBACK["failure_mode"]
-        reasoning    = raw.get("reasoning")    or _DIAGNOSIS_FALLBACK["reasoning"]
+        failure_mode = raw.get("failure_mode") or "unspecified"
+        reasoning    = raw.get("reasoning")    or _REASONING_UNAVAILABLE
 
         # Preserve the LLM's diagnosis. A downstream uncertainty guard in
         # graph_builder._finalize_node decides whether to collapse to fallback

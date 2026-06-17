@@ -1,57 +1,59 @@
-"""
-Evidence Retrieval Agent — keyword-based document retrieval from stored manuals and SOPs.
+"""Evidence Retrieval Agent — hybrid semantic + keyword search over ingested documents.
 
-Input  : state.machine_context, state.maintenance_history (for keyword extraction)
+Phase 2 upgrade: queries the document_chunks table in PostgreSQL via pgvector
+cosine-similarity search, then re-ranks with a keyword overlap boost.
+
+Retrieval strategy (two-stage):
+  Stage 1 — Vector search (semantic):
+    Embed the query → cosine similarity against document_chunks.embedding
+    → top 20 candidates.  Finds "thermal stress" when query says "heat anomaly".
+
+  Stage 2 — Keyword boost (lexical):
+    F1 overlap between query keywords and each candidate chunk.
+    Adds a bonus to candidates that also contain exact query terms.
+
+  Final score = 0.7 × cosine_similarity + 0.3 × keyword_f1
+
+  Fallback: if pgvector is unavailable or embeddings are null, falls back to
+  pure keyword F1 over all chunks in the DB.  Keyword-only is also used when
+  the embedding model hasn't loaded yet (e.g. cold start).
+
+Input  : state.machine_context, state.anomaly, state.maintenance_history
+         (Retrieval uses a fresh DB session via AsyncSessionLocal)
 Output : AgentResult.data = {
     "retrieved_evidence": [
         {
-            "source": str,           # filename
-            "source_type": str,      # "manual" | "sop"
-            "chunk": str,            # text passage
-            "relevance_score": float # 0.0 – 1.0
+            "source": str,
+            "source_type": str,
+            "chunk": str,
+            "relevance_score": float,
+            "retrieval_method": "hybrid" | "keyword"
         }
     ],
     "documents_searched": int,
-    "chunks_evaluated": int
+    "chunks_evaluated": int,
 }
-
-No RAG, no embeddings. Pure keyword overlap scoring.
 """
 
 import re
-from pathlib import Path
+import logging
 from typing import Any
+
+from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.base import AgentResult
 from app.core.state_contract import VulcanOpsState
+from app.db.session import AsyncSessionLocal
+from app.models.document_chunk import DocumentChunk
+from app.services import embedding_service
 
-_STORAGE_ROOT = Path(__file__).resolve().parents[2] / "storage" / "uploads"
-_CHUNK_MIN_WORDS = 20
-_CHUNK_MAX_WORDS = 120
-_TOP_K = 8
+logger = logging.getLogger(__name__)
 
-# ── document cache ────────────────────────────────────────────────────────────
-# Avoid reading and parsing the same document files on every agent call.
-# Cache is invalidated when any file's modification time changes (new upload).
-# This saves ~50-200ms per deep-analysis machine when 3+ machines share the
-# same evidence corpus.
-
-_DOC_CACHE: list[tuple[str, str, str]] | None = None
-_DOC_CACHE_SNAPSHOT: frozenset[tuple[str, float]] = frozenset()
-
-
-def _get_file_snapshot() -> frozenset[tuple[str, float]]:
-    """Return (path, mtime) pairs for all document files — used as cache key."""
-    snap: set[tuple[str, float]] = set()
-    for source_type in ("manuals", "sops"):
-        doc_dir = _STORAGE_ROOT / source_type
-        if doc_dir.exists():
-            for txt_file in doc_dir.glob("*.txt"):
-                try:
-                    snap.add((str(txt_file), txt_file.stat().st_mtime))
-                except OSError:
-                    pass
-    return frozenset(snap)
+_TOP_K_VECTOR = 20      # candidates from vector search
+_TOP_K_FINAL = 8        # returned to the pipeline
+_VECTOR_WEIGHT = 0.7
+_KEYWORD_WEIGHT = 0.3
 
 _STOP_WORDS = {
     "the", "a", "an", "and", "or", "of", "to", "in", "is", "it", "that",
@@ -62,143 +64,178 @@ _STOP_WORDS = {
 }
 
 
-def _tokenize(text: str) -> set[str]:
-    words = re.findall(r"[a-zA-Z]{3,}", text.lower())
+def _tokenize(text_str: str) -> set[str]:
+    words = re.findall(r"[a-zA-Z]{3,}", text_str.lower())
     return {w for w in words if w not in _STOP_WORDS}
 
 
-def _split_chunks(text: str) -> list[str]:
-    """Split text into paragraph-level chunks within word count bounds."""
-    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-    chunks: list[str] = []
-    for para in paragraphs:
-        words = para.split()
-        if len(words) < _CHUNK_MIN_WORDS:
-            continue
-        if len(words) <= _CHUNK_MAX_WORDS:
-            chunks.append(para)
-        else:
-            # Slide a window over long paragraphs
-            step = _CHUNK_MAX_WORDS // 2
-            for i in range(0, len(words) - _CHUNK_MIN_WORDS, step):
-                chunk = " ".join(words[i : i + _CHUNK_MAX_WORDS])
-                chunks.append(chunk)
-    return chunks
+def _keyword_f1(query_kw: set[str], chunk_kw: set[str]) -> float:
+    if not query_kw or not chunk_kw:
+        return 0.0
+    overlap = query_kw & chunk_kw
+    if not overlap:
+        return 0.0
+    precision = len(overlap) / len(chunk_kw)
+    recall = len(overlap) / len(query_kw)
+    return 2 * precision * recall / (precision + recall)
 
 
-def _load_documents() -> list[tuple[str, str, str]]:
-    """
-    Returns list of (source_filename, source_type, full_text) tuples.
-
-    Cache behaviour: documents are re-read only when the set of files or their
-    modification times change. For a typical 15-machine run, 14 of the 15
-    calls will be served from cache after the first machine loads the docs.
-    """
-    global _DOC_CACHE, _DOC_CACHE_SNAPSHOT
-    current_snap = _get_file_snapshot()
-    if _DOC_CACHE is not None and current_snap == _DOC_CACHE_SNAPSHOT:
-        return _DOC_CACHE
-
-    documents: list[tuple[str, str, str]] = []
-    for source_type in ("manuals", "sops"):
-        doc_dir = _STORAGE_ROOT / source_type
-        if not doc_dir.exists():
-            continue
-        for txt_file in doc_dir.glob("*.txt"):
-            try:
-                text = txt_file.read_text(encoding="utf-8", errors="ignore")
-                if text.strip():
-                    documents.append((txt_file.name, source_type.rstrip("s"), text))
-            except OSError:
-                continue
-
-    _DOC_CACHE = documents
-    _DOC_CACHE_SNAPSHOT = current_snap
-    return _DOC_CACHE
-
-
-def _build_query_keywords(state: VulcanOpsState) -> set[str]:
+def _build_query(state: VulcanOpsState) -> tuple[str, set[str]]:
+    """Build a rich query string and keyword set from the current machine state."""
+    parts: list[str] = []
     keywords: set[str] = set()
 
     if state.machine_context:
-        keywords |= _tokenize(state.machine_context.machine_type)
-        keywords |= _tokenize(state.machine_context.machine_name)
-        keywords |= _tokenize(state.machine_context.plant)
-        keywords |= _tokenize(state.machine_context.location)
+        m = state.machine_context
+        parts.append(f"{m.machine_type} {m.machine_name} maintenance failure")
+        keywords |= _tokenize(m.machine_type)
+        keywords |= _tokenize(m.machine_name)
 
-    # Add the current fault signal so manuals/SOPs about the specific symptom rank higher.
-    if state.anomaly and state.anomaly.sensor:
-        keywords |= _tokenize(state.anomaly.sensor)
-        if state.anomaly.deviation_percent is not None and state.anomaly.deviation_percent > 0:
-            keywords.add("high")
-            keywords.add("elevated")
+    if state.anomaly and state.anomaly.detected and state.anomaly.sensor:
+        sensor = state.anomaly.sensor
+        parts.append(f"{sensor} anomaly threshold exceedance inspection")
+        keywords |= _tokenize(sensor)
+        keywords.update({"anomaly", "threshold", "exceedance", "inspection", "failure"})
 
-    for record in state.maintenance_history:
-        keywords |= _tokenize(record.failure_mode)
-        keywords |= _tokenize(record.action_taken)
+    for record in state.maintenance_history[:3]:
+        if record.failure_mode:
+            parts.append(record.failure_mode)
+            keywords |= _tokenize(record.failure_mode)
+        if record.action_taken:
+            keywords |= _tokenize(record.action_taken)
 
-    return keywords
+    query_text = ". ".join(parts) if parts else "industrial equipment maintenance failure inspection"
+    return query_text, keywords
 
 
-def run(state: VulcanOpsState) -> AgentResult:
-    documents = _load_documents()
+async def _vector_search(
+    query_embedding: list[float],
+    query_keywords: set[str],
+    db: AsyncSession,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    """
+    Cosine similarity search in pgvector.
 
-    if not documents:
+    asyncpg does not support the '::' PostgreSQL cast syntax inside parameterized
+    queries, so we inline the vector literal directly.  The value is our own
+    float list (not user input), so this is safe.
+    """
+    # Format as pgvector text literal: '[0.1,0.2,...]'
+    vec_literal = "[" + ",".join(f"{v:.8f}" for v in query_embedding) + "]"
+
+    sql = text(
+        "SELECT chunk_id, source_filename, source_type, chunk_text, "
+        f"       1.0 - (embedding::vector <=> '{vec_literal}'::vector) AS similarity "
+        "FROM document_chunks "
+        "WHERE embedding IS NOT NULL "
+        f"ORDER BY embedding::vector <=> '{vec_literal}'::vector "
+        f"LIMIT {top_k}"
+    )
+    result = await db.execute(sql)
+    rows = result.fetchall()
+
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        chunk_kw = _tokenize(row.chunk_text)
+        kw_score = _keyword_f1(query_keywords, chunk_kw)
+        hybrid_score = _VECTOR_WEIGHT * float(row.similarity) + _KEYWORD_WEIGHT * kw_score
+        results.append({
+            "source": row.source_filename,
+            "source_type": row.source_type,
+            "chunk": row.chunk_text,
+            "relevance_score": round(hybrid_score, 4),
+            "retrieval_method": "hybrid",
+        })
+
+    results.sort(key=lambda x: x["relevance_score"], reverse=True)
+    return results
+
+
+async def _keyword_search(
+    query_keywords: set[str],
+    db: AsyncSession,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    """Pure keyword F1 fallback — used when embeddings are not available."""
+    result = await db.execute(
+        select(
+            DocumentChunk.source_filename,
+            DocumentChunk.source_type,
+            DocumentChunk.chunk_text,
+        )
+    )
+    rows = result.fetchall()
+
+    scored: list[dict[str, Any]] = []
+    for row in rows:
+        chunk_kw = _tokenize(row.chunk_text)
+        score = _keyword_f1(query_keywords, chunk_kw)
+        if score > 0:
+            scored.append({
+                "source": row.source_filename,
+                "source_type": row.source_type,
+                "chunk": row.chunk_text,
+                "relevance_score": round(score, 4),
+                "retrieval_method": "keyword",
+            })
+
+    scored.sort(key=lambda x: x["relevance_score"], reverse=True)
+    return scored[:top_k]
+
+
+async def run(state: VulcanOpsState) -> AgentResult:
+    """
+    Async evidence retrieval — opens its own DB session so the agent graph
+    does not need to pass sessions through state.
+    """
+    query_text, query_keywords = _build_query(state)
+
+    async with AsyncSessionLocal() as db:
+        # Count available chunks for metadata.
+        count_result = await db.execute(select(func.count(DocumentChunk.chunk_id)))
+        total_chunks: int = count_result.scalar_one()
+
+        if total_chunks == 0:
+            return AgentResult(
+                status="success",
+                data={
+                    "retrieved_evidence": [],
+                    "documents_searched": 0,
+                    "chunks_evaluated": 0,
+                },
+                errors=["No documents in the semantic index. Upload manuals and SOPs to enable evidence retrieval."],
+            )
+
+        # Try vector search first.
+        query_embedding = await embedding_service.embed(query_text)
+
+        if query_embedding is not None:
+            try:
+                results = await _vector_search(query_embedding, query_keywords, db, _TOP_K_VECTOR)
+                results = results[:_TOP_K_FINAL]
+                logger.info(
+                    "Vector search returned %d results for query %r",
+                    len(results), query_text[:60],
+                )
+            except Exception as exc:
+                logger.warning("Vector search failed (%s) — falling back to keyword", exc)
+                # asyncpg leaves the transaction in an aborted state after a SQL
+                # error.  Roll back so the keyword fallback query can run cleanly.
+                await db.rollback()
+                results = await _keyword_search(query_keywords, db, _TOP_K_FINAL)
+        else:
+            # Embedding model not loaded — pure keyword fallback.
+            results = await _keyword_search(query_keywords, db, _TOP_K_FINAL)
+
+        # Count distinct source files in results.
+        docs_searched = len({r["source"] for r in results})
+
         return AgentResult(
             status="success",
             data={
-                "retrieved_evidence": [],
-                "documents_searched": 0,
-                "chunks_evaluated": 0,
+                "retrieved_evidence": results,
+                "documents_searched": docs_searched,
+                "chunks_evaluated": total_chunks,
             },
-            errors=["No manuals or SOPs found in storage. Upload documents to enable evidence retrieval."],
         )
-
-    query_keywords = _build_query_keywords(state)
-
-    if not query_keywords:
-        return AgentResult(
-            status="error",
-            data={},
-            errors=["Cannot build query: machine_context and maintenance_history are both empty"],
-        )
-
-    scored: list[dict[str, Any]] = []
-    total_chunks = 0
-
-    for filename, source_type, text in documents:
-        chunks = _split_chunks(text)
-        total_chunks += len(chunks)
-
-        for chunk in chunks:
-            chunk_keywords = _tokenize(chunk)
-            if not chunk_keywords:
-                continue
-            overlap = query_keywords & chunk_keywords
-            if not overlap:
-                continue
-            # Balanced F1-style score: rewards chunks that cover many query terms
-            # (recall) while also being focused on those terms (precision).
-            recall = len(overlap) / len(query_keywords)
-            precision = len(overlap) / len(chunk_keywords)
-            score = 2 * (precision * recall) / (precision + recall) if (precision + recall) else 0.0
-            scored.append(
-                {
-                    "source": filename,
-                    "source_type": source_type,
-                    "chunk": chunk,
-                    "relevance_score": round(score, 4),
-                }
-            )
-
-    scored.sort(key=lambda x: x["relevance_score"], reverse=True)
-    top = scored[:_TOP_K]
-
-    return AgentResult(
-        status="success",
-        data={
-            "retrieved_evidence": top,
-            "documents_searched": len(documents),
-            "chunks_evaluated": total_chunks,
-        },
-    )
