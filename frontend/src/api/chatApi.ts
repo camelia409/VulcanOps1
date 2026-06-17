@@ -1,6 +1,10 @@
 import { API_BASE_URL } from "../config";
 import type { ChatMessage, ChatResponse, PlantOverview, SessionContext } from "../types";
 
+async function parseErrorBody(res: Response): Promise<{ detail?: string }> {
+  return res.json().catch(() => ({}));
+}
+
 export async function sendChatQuery(
   query: string,
   sessionContext?: SessionContext
@@ -14,27 +18,28 @@ export async function sendChatQuery(
     }),
   });
 
-  const data = await res.json();
   if (!res.ok) {
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
-  return data as ChatResponse;
+  return (await res.json()) as ChatResponse;
 }
 
 export async function getChatHistory(limit = 50): Promise<ChatMessage[]> {
   const res = await fetch(`${API_BASE_URL}/api/v1/chat/history?limit=${limit}`);
-  const data = await res.json();
   if (!res.ok) {
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
+  const data = await res.json();
   return (data.messages ?? []) as ChatMessage[];
 }
 
 export async function getPlantOverview(): Promise<PlantOverview> {
   const res = await fetch(`${API_BASE_URL}/api/v1/chat/plant-overview`);
-  const data = await res.json();
   if (!res.ok) {
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
-  return data as PlantOverview;
+  return (await res.json()) as PlantOverview;
 }

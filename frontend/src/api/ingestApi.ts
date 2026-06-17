@@ -5,6 +5,10 @@ import type {
   IngestedFileListResponse,
 } from "../types";
 
+async function parseErrorBody(res: Response): Promise<{ detail?: string }> {
+  return res.json().catch(() => ({}));
+}
+
 export async function ingestFiles(files: File[]): Promise<IngestResponse> {
   if (files.length === 0) {
     throw new Error("No files provided");
@@ -18,22 +22,21 @@ export async function ingestFiles(files: File[]): Promise<IngestResponse> {
     body: form,
   });
 
-  const data = await res.json();
-
   if (!res.ok) {
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
 
-  return data as IngestResponse;
+  return (await res.json()) as IngestResponse;
 }
 
 export async function getIngestStatus(): Promise<IngestStatusSummary> {
   const res = await fetch(`${API_BASE_URL}/api/v1/ingest/status`);
-  const data = await res.json();
   if (!res.ok) {
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
-  return data as IngestStatusSummary;
+  return (await res.json()) as IngestStatusSummary;
 }
 
 export async function listIngestedFiles(
@@ -41,11 +44,11 @@ export async function listIngestedFiles(
   limit = 100
 ): Promise<IngestedFileListResponse> {
   const res = await fetch(`${API_BASE_URL}/api/v1/upload/files?skip=${skip}&limit=${limit}`);
-  const data = await res.json();
   if (!res.ok) {
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
-  return data as IngestedFileListResponse;
+  return (await res.json()) as IngestedFileListResponse;
 }
 
 export async function deleteIngestedFile(fileId: string): Promise<void> {
@@ -53,7 +56,7 @@ export async function deleteIngestedFile(fileId: string): Promise<void> {
     method: "DELETE",
   });
   if (!res.ok) {
-    const data = await res.json();
+    const data = await parseErrorBody(res);
     throw new Error(data.detail ?? `Server error ${res.status}`);
   }
 }
