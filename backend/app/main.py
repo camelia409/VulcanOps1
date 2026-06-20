@@ -15,6 +15,9 @@ if _lc is not None:
 else:
     del _lc
 
+import asyncio
+import json
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -61,12 +64,68 @@ def _ensure_storage_dirs() -> None:
         (storage_root / sub).mkdir(parents=True, exist_ok=True)
 
 
+def _configure_logging() -> None:
+    """Ensure the vulcanops.pipeline logger emits INFO-level structured logs."""
+    pipeline_logger = logging.getLogger("vulcanops.pipeline")
+    pipeline_logger.setLevel(logging.INFO)
+    if not pipeline_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        pipeline_logger.addHandler(handler)
+
+
+_PIPELINE_LOG = logging.getLogger("vulcanops.pipeline")
+
+
+async def _warmup_llm() -> None:
+    """Fire-and-forget: ping Ollama so the model is loaded before the first real request."""
+    from app.services.llm_service import llm_service
+    t0 = time.monotonic()
+    try:
+        await llm_service.call_text(
+            agent="warmup",
+            system="ping",
+            user="reply: ok",
+            timeout=60.0,
+        )
+        _PIPELINE_LOG.info(json.dumps({
+            "event": "llm_warmup",
+            "model": settings.LLM_MODEL,
+            "status": "success",
+            "duration_ms": round((time.monotonic() - t0) * 1000, 1),
+        }))
+    except Exception as exc:
+        _PIPELINE_LOG.warning(json.dumps({
+            "event": "llm_warmup",
+            "model": settings.LLM_MODEL,
+            "status": "failed",
+            "error": type(exc).__name__,
+        }))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize database schema and storage directories on startup."""
+    """Initialize database schema, checkpointer, and storage directories on startup."""
+    _configure_logging()
     _ensure_storage_dirs()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Alert bus — module-level singleton wired into app.state for FastAPI routes
+    from app.services.alert_bus import alert_bus
+    app.state.alert_bus = alert_bus
+    _PIPELINE_LOG.info('{"event": "alert_bus_ready"}')
+
+    # Chat checkpointer — must run before warmup ping so tables exist
+    from app.services.chat_checkpointer import VulcanOpsCheckpointer
+    from app.orchestrator.chat_graph import build_chat_graph
+    checkpointer = VulcanOpsCheckpointer()
+    await checkpointer.setup()
+    app.state.chat_checkpointer = checkpointer
+    app.state.chat_graph = build_chat_graph(checkpointer)
+    _PIPELINE_LOG.info('{"event": "chat_checkpointer_ready"}')
+
+    asyncio.create_task(_warmup_llm())
     yield
     # Cleanup on shutdown
     await engine.dispose()
@@ -116,14 +175,14 @@ async def ready():
         settings.INFLUXDB_HOST and settings.INFLUXDB_TOKEN != "change-me-in-production"
     ))
 
-    openrouter_ok = bool(
-        settings.OPENROUTER_API_KEY
-        and settings.OPENROUTER_API_KEY != "change-me-in-production"
-        and settings.OPENROUTER_BASE_URL
+    llm_ok = bool(
+        settings.LLM_API_KEY
+        and settings.LLM_API_KEY != "change-me-in-production"
+        and settings.LLM_BASE_URL
     )
 
     return {
         "database": db_ok,
         "influx": influx_ok,
-        "openrouter": openrouter_ok,
+        "llm": llm_ok,
     }

@@ -1,6 +1,7 @@
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Resolve the root .env regardless of where uvicorn is launched from.
@@ -47,16 +48,25 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = "http://localhost:5173"
     FRONTEND_URL: str = ""
 
-    # OpenRouter LLM — single model used for all LLM calls
-    OPENROUTER_API_KEY: str = ""
-    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
-    LLM_MODEL: str = "google/gemini-2.5-flash"
-    LLM_TIMEOUT: float = 20.0
+    # LLM provider — OpenAI-compatible endpoint used for all LLM calls
+    LLM_API_KEY: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("LLM_API_KEY", "MOONSHOT_API_KEY"),
+    )
+    LLM_BASE_URL: str = Field(
+        default="https://api.moonshot.ai/v1",
+        validation_alias=AliasChoices("LLM_BASE_URL", "MOONSHOT_BASE_URL"),
+    )
+    LLM_MODEL: str = Field(
+        default="kimi-k2-0905-preview",
+        validation_alias=AliasChoices("LLM_MODEL", "MOONSHOT_MODEL"),
+    )
+    LLM_TIMEOUT_SECONDS: float = 30.0
 
     # Hard ceiling for the synchronous deep-analysis endpoint. If the pipeline
     # does not finish within this window it is aborted and the batch is marked
     # failed so the UI never stays in "running" forever.
-    DEEP_ANALYSIS_TIMEOUT_SECONDS: float = 90.0
+    DEEP_ANALYSIS_TIMEOUT_SECONDS: float = 180.0
 
     @property
     def database_url(self) -> str:

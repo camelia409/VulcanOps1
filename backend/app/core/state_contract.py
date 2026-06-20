@@ -8,7 +8,8 @@ no field is overwritten by a later stage without explicit intent.
 
 import uuid
 from datetime import datetime
-from typing import Any
+from operator import add
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field
 
@@ -34,11 +35,26 @@ class RULPrediction(BaseModel):
     basis: str | None = None
 
 
+class ReActStep(BaseModel):
+    iteration: int
+    thought: str
+    action: str
+    action_input: dict[str, Any] = Field(default_factory=dict)
+    observation: str
+
+
 class DiagnosisResult(BaseModel):
     root_cause: str | None = None
     failure_mode: str | None = None
     confidence: float | None = Field(None, ge=0.0, le=1.0)
     supporting_evidence: list[str] = Field(default_factory=list)
+    reasoning_trace: list[ReActStep] = Field(default_factory=list)
+
+
+class ExecutionPlan(BaseModel):
+    stages: list[str] = Field(default_factory=list)
+    skipped: dict[str, str] = Field(default_factory=dict)
+    rationale: str = ""
 
 
 class VerificationResult(BaseModel):
@@ -66,6 +82,8 @@ class StrategyDecision(BaseModel):
     parts_required: list[str] = Field(default_factory=list)
     safety_notes: str | None = None
     resource_requirements: str | None = None
+    procurement_strategy: str | None = None
+    constraint_violations: list[str] = Field(default_factory=list)
 
 
 class RoleReports(BaseModel):
@@ -104,6 +122,7 @@ class VulcanOpsState(BaseModel):
     retrieved_evidence: list[dict[str, Any]] = Field(default_factory=list)
 
     # ── Stage 4: Analysis ─────────────────────────────────────────────────────
+    execution_plan: ExecutionPlan | None = None
     anomaly: AnomalyDetail | None = None
     rul_prediction: RULPrediction | None = None
     diagnosis: DiagnosisResult | None = None
@@ -118,7 +137,15 @@ class VulcanOpsState(BaseModel):
     role_reports: RoleReports = Field(default_factory=RoleReports)
     final_report: dict[str, Any] | None = None
 
+    # ── Engineer feedback (retrieved before diagnosis) ────────────────────────
+    prior_feedback: list[dict[str, Any]] = Field(default_factory=list)
+
+    # ── Agent-to-agent feedback cycle ─────────────────────────────────────────
+    verification_revision_count: int = 0
+    verification_contradictions: list[dict[str, Any]] = Field(default_factory=list)
+    verification_recommendation: str | None = None
+
     # ── Observability ─────────────────────────────────────────────────────────
     llm_telemetry: LLMTelemetry = Field(default_factory=LLMTelemetry)
-    errors: list[dict[str, Any]] = Field(default_factory=list)
-    execution_trace: list[dict[str, Any]] = Field(default_factory=list)
+    errors: Annotated[list[dict[str, Any]], add] = Field(default_factory=list)
+    execution_trace: Annotated[list[dict[str, Any]], add] = Field(default_factory=list)

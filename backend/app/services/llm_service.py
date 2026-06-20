@@ -1,54 +1,68 @@
 """
-LLM service — sole OpenRouter call point for VulcanOps.
+LLM service — sole LLM provider call point for VulcanOps.
 
-Only diagnosis_agent and communication_agent may import this module.
-No other file in the codebase should call OpenRouter directly.
+Uses an OpenAI-compatible endpoint (configurable via LLM_BASE_URL).
+Provides three public methods:
+  - call_json:       structured JSON output
+  - call_with_tools: native tool-calling
+  - call_text:       plain text completion
+
+Every call emits a structured log entry with status, timing, and token usage.
 """
 
-import hashlib
+from __future__ import annotations
+
 import json
 import logging
-import re
 import time
-from collections import OrderedDict
-from typing import Any
+import uuid
+from dataclasses import dataclass
+from typing import Any, TypeVar
 
-from openai import AsyncOpenAI, APIConnectionError, APIStatusError, APITimeoutError
+from pydantic import BaseModel
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
 from app.core.config import settings
-from app.services.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
 
 logger = logging.getLogger(__name__)
-
-# Structured pipeline logger — emits JSON lines for per-call observability.
-# Grep for "vulcanops.pipeline" in logs to trace every LLM invocation.
 _PIPELINE_LOG = logging.getLogger("vulcanops.pipeline")
 
-# ── in-process LLM prompt cache ───────────────────────────────────────────────
-# Key  : md5(model + "||" + system_prompt + "||" + user_prompt)
-# Value: (result_dict, telemetry_dict)
-# When a deep-analysis button is clicked minutes after ingestion and sensor
-# data has not changed, the prompts are identical → cache hit, zero latency.
-# Process-scoped; cleared on server restart. Max 500 entries (LRU eviction).
 
-_LLM_CACHE: OrderedDict[str, tuple[dict[str, Any], dict[str, Any]]] = OrderedDict()
-_LLM_CACHE_MAX = 500
-
-# Bump this whenever prompts change so stale cache entries are never returned.
-_PROMPT_SCHEMA_VERSION = "v3"
+class LLMError(Exception):
+    """Base class for all LLM service failures."""
 
 
-def _prompt_cache_key(model: str, system_prompt: str, user_prompt: str) -> str:
-    raw = f"{_PROMPT_SCHEMA_VERSION}||{model}||{system_prompt}||{user_prompt}"
-    return hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()
+class LLMTimeout(LLMError):
+    """The LLM request exceeded the configured timeout."""
 
 
-def llm_cache_stats() -> dict[str, int]:
-    """Return current cache size (useful for health checks / debugging)."""
-    return {"entries": len(_LLM_CACHE), "max": _LLM_CACHE_MAX}
+class LLMEmpty(LLMError):
+    """The LLM returned an empty or unusable response."""
 
-# ── fallbacks returned on any API failure ──────────────────────────────────────
 
+class LLMJSONError(LLMError):
+    """The LLM returned text that could not be parsed as JSON."""
+
+
+class LLMAPIError(LLMError):
+    """The LLM provider returned an HTTP error or connection failure."""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallResult:
+    """Result of a native tool-calling LLM call."""
+
+    kind: str  # "tool_call" | "final"
+    tool_name: str | None = None
+    tool_args: dict[str, Any] | None = None
+    content: str | None = None
+    tool_call_id: str | None = None
+
+
+# Fallback payloads returned to callers when the LLM is unavailable.
 _DIAGNOSIS_FALLBACK: dict[str, Any] = {
     "root_cause": "manual inspection required",
     "failure_mode": "insufficient evidence",
@@ -56,8 +70,6 @@ _DIAGNOSIS_FALLBACK: dict[str, Any] = {
     "confidence": 0.2,
     "evidence_used": [],
 }
-
-_REASONING_UNAVAILABLE = "Reasoning not provided by model. See sensor anomaly data and evidence above."
 
 _CIRCUIT_BREAKER_COMMUNICATION_MESSAGE = (
     "Evidence is insufficient to determine root cause. "
@@ -70,161 +82,49 @@ _COMMUNICATION_FALLBACK: dict[str, Any] = {
     "manager": _CIRCUIT_BREAKER_COMMUNICATION_MESSAGE,
 }
 
-_FALLBACK_TELEMETRY: dict[str, Any] = {
-    "model": "fallback",
-    "latency_ms": 0.0,
-    "input_tokens": 0,
-    "output_tokens": 0,
-    "fallback_used": True,
-}
 
-# ── circuit breaker ────────────────────────────────────────────────────────────
-# One breaker per process. Wraps the actual OpenRouter network call inside
-# llm_service._call(). On OPEN it short-circuits the request and returns the
-# deterministic fallback without hitting the API.
-
-llm_circuit_breaker = CircuitBreaker()
-
-# ── system prompts ─────────────────────────────────────────────────────────────
-
-_JSON_RULES = (
-    "\n\nCRITICAL INSTRUCTIONS:\n"
-    "Return ONLY valid JSON.\n"
-    "Do NOT explain.\n"
-    "Do NOT reason.\n"
-    "Do NOT use markdown.\n"
-    "Do NOT use code blocks.\n"
-    "Do NOT use comments.\n"
-    "Do NOT prefix with //\n"
-    "Do NOT suffix with text.\n"
-    "Do NOT output analysis.\n"
-    "Do NOT output chain of thought.\n"
-    "Output exactly one JSON object."
-)
-
-_DIAGNOSIS_SYSTEM = (
-    "You are an industrial reliability engineer performing root cause analysis. "
-    "Respond ONLY with valid JSON. No prose, no markdown fences, no explanation outside the JSON object.\n"
-    'Required schema: {"root_cause":"<string>","failure_mode":"<string>",'
-    '"reasoning":"<string>","confidence":<float 0.0-1.0>,"evidence_used":["<string>",...]}\n\n'
-    "EVIDENCE GROUNDING RULES:\n"
-    "Use ONLY evidence explicitly present in this request: sensor readings, maintenance history, "
-    "manuals, and SOPs provided below.\n"
-    "Never invent failures. Evidence that SUGGESTS a cause is sufficient to name it — "
-    "you do not need proof beyond reasonable doubt.\n\n"
-    "CONFIDENCE SCALE (rate your diagnosis, do NOT suppress it):\n"
-    "- 0.70–1.0: High confidence — evidence is consistent and points clearly to a cause. "
-    "Name the specific component or system.\n"
-    "- 0.50–0.69: Cautious diagnosis — evidence suggests a likely cause but has gaps. "
-    "Name the most probable cause and note what is unconfirmed.\n"
-    "- 0.25–0.49: Preliminary hypothesis — signal is mixed or indirect. "
-    "State the best hypothesis given available data and list what additional checks would confirm it.\n"
-    "- < 0.25: Evidence is genuinely absent. Only then use root_cause='manual inspection required'.\n\n"
-    "CRITICAL RULE: Always provide your most specific defensible diagnosis, regardless of confidence. "
-    "The downstream system will label it 'cautious' or 'preliminary' — your job is to give the "
-    "most actionable answer the evidence supports, never to self-censor. "
-    "A specific hypothesis at 0.40 confidence is far more useful than 'manual inspection required'."
-    + _JSON_RULES
-)
-
-_COPILOT_SYSTEM = (
-    "You are an industrial reliability copilot. "
-    "Answer the operator's question using ONLY the machine data provided. "
-    "Be concise: 1-2 sentences. Plain English. No bullet points. "
-    "Never invent failures, root causes, or sensor values not present in the data. "
-    "If the answer is not in the data, say so directly.\n"
-    'Required schema: {"answer": "<string>"}'
-    + _JSON_RULES
-)
-
-_COMMUNICATION_SYSTEM = (
-    "You are a senior reliability engineer writing operational reports for an industrial plant. "
-    "Respond ONLY with valid JSON. No prose, no markdown fences, no explanation outside the JSON object.\n"
-    "Each summary must be 150-200 words, specific, factual, and grounded in the evidence provided.\n"
-    'Required schema: {"engineer":"<string>","supervisor":"<string>","manager":"<string>"}\n\n'
-    "REPORT RULES:\n"
-    "- Use concrete component/system names and sensor values from the investigation summary.\n"
-    "- Cite evidence briefly (e.g., 'vibration 12% above threshold', 'maintenance history shows seal replacement').\n"
-    "- Do NOT use generic filler such as 'further investigation is needed' unless the summary explicitly states low confidence.\n"
-    "- Do NOT invent failures, costs, or timelines not present in the data.\n"
-    "- engineer: fault description, first checks, parts, safety, post-repair monitoring.\n"
-    "- supervisor: operational impact, resource needs, timeline, escalation.\n"
-    "- manager: business risk, cost exposure, compliance, strategic recommendation."
-    + _JSON_RULES
-)
+def _telemetry_from_usage(usage: Any) -> dict[str, int | None]:
+    if usage is None:
+        return {"tokens_in": None, "tokens_out": None}
+    return {
+        "tokens_in": getattr(usage, "prompt_tokens", None),
+        "tokens_out": getattr(usage, "completion_tokens", None),
+    }
 
 
-# ── JSON extraction helpers ────────────────────────────────────────────────────
-
-def _strip_thinking(text: str) -> str:
-    """Remove Qwen3 chain-of-thought <think>...</think> blocks before JSON."""
-    return re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
-
-
-def _extract_json(text: str) -> dict[str, Any]:
-    """
-    Robustly parse JSON from an LLM response.
-    Handles: raw JSON, markdown code blocks, JSON embedded in prose.
-    Raises ValueError if no valid JSON can be found.
-    """
-    text = _strip_thinking(text)
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    m = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text)
-    if m:
-        try:
-            return json.loads(m.group(1).strip())
-        except json.JSONDecodeError:
-            pass
-
-    m = re.search(r"\{[\s\S]+\}", text)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    raise ValueError(f"No valid JSON in LLM response (first 200 chars): {text[:200]!r}")
+def _log_llm_call(
+    *,
+    agent: str,
+    status: str,
+    duration_ms: float,
+    error: str | None = None,
+    tool_calls: int = 0,
+    usage: Any = None,
+) -> None:
+    """Emit a single structured log line for every LLM invocation."""
+    telemetry = _telemetry_from_usage(usage)
+    payload = {
+        "event": "llm_call",
+        "agent": agent,
+        "model": settings.LLM_MODEL,
+        "provider": "ollama",
+        "duration_ms": round(duration_ms, 1),
+        "status": status,
+        "tokens_in": telemetry["tokens_in"],
+        "tokens_out": telemetry["tokens_out"],
+        "tool_calls": tool_calls,
+    }
+    if error:
+        payload["error"] = error
+    _PIPELINE_LOG.info(json.dumps(payload))
 
 
-# ── coercion helpers ──────────────────────────────────────────────────────────
-
-def _to_str(value: Any, fallback: str = "") -> str:
-    """Coerce an LLM field value to a plain string.
-
-    Gemini (and other models) sometimes return a nested dict instead of a plain
-    string for fields declared as "<string>" in the schema — e.g.
-      {"engineer": {"summary": "...", "actions": [...]}}
-    This helper normalises all such cases so callers always receive str.
-    """
-    if value is None:
-        return fallback
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        # Try common prose-field names the model may have invented
-        for key in ("text", "report", "summary", "content", "message", "body", "narrative"):
-            candidate = value.get(key)
-            if isinstance(candidate, str) and candidate.strip():
-                return candidate
-        # No canonical key — join all non-empty string leaf values in order
-        parts = [str(v) for v in value.values() if v is not None and str(v).strip()]
-        return " ".join(parts) if parts else fallback
-    return str(value)
-
-
-# ── service ────────────────────────────────────────────────────────────────────
-
-class OpenRouterLLMService:
+class LLMService:
     """
     Single reusable LLM gateway for VulcanOps.
-    Uses AsyncOpenAI configured for OpenRouter's API.
 
-    Timeout: settings.LLM_TIMEOUT (default 45 s).  Retries: 0.  On any failure: deterministic fallback.
+    Configured via LLM_BASE_URL / LLM_API_KEY / LLM_MODEL (OpenAI-compatible).
+    Timeout: settings.LLM_TIMEOUT_SECONDS (default 30 s). Retries: 0.
     """
 
     def __init__(self) -> None:
@@ -232,251 +132,386 @@ class OpenRouterLLMService:
 
     def _get_client(self) -> AsyncOpenAI:
         if self._client is None:
+            if not settings.LLM_API_KEY:
+                raise LLMError("LLM_API_KEY is not configured")
             self._client = AsyncOpenAI(
-                api_key=settings.OPENROUTER_API_KEY,
-                base_url=settings.OPENROUTER_BASE_URL,
-                # Hard total-request timeout. httpx.Timeout(n) was a per-chunk
-                # read timeout and did not bound total latency. A plain float
-                # is interpreted by the openai SDK as the total request timeout.
-                timeout=settings.LLM_TIMEOUT,
-                # No retries: a single slow/failed call already occupies the
-                # request slot. Retrying compounds latency without recovery benefit.
+                api_key=settings.LLM_API_KEY,
+                base_url=settings.LLM_BASE_URL,
+                timeout=settings.LLM_TIMEOUT_SECONDS,
                 max_retries=0,
-                default_headers={
-                    "HTTP-Referer": "https://vulcanops.io",
-                    "X-Title": "VulcanOps",
-                },
             )
         return self._client
 
-    async def _do_api_call(
+    async def call_json(
         self,
-        model: str,
-        system_prompt: str,
-        user_prompt: str,
-        temperature: float,
+        *,
+        agent: str,
+        system: str,
+        user: str,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         """
-        Raw OpenRouter call. Raises on any failure so the circuit breaker can
-        count it. The caller (_call) handles fallback and telemetry.
+        Call the model with JSON output format. Returns the parsed dict.
+
+        Raises LLMTimeout, LLMEmpty, LLMJSONError, or LLMAPIError.
         """
-        if not settings.OPENROUTER_API_KEY:
-            raise ValueError("OPENROUTER_API_KEY not set")
-
-        response = await self._get_client().chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=temperature,
-        )
-
-        raw_text = response.choices[0].message.content or ""
-        parsed = _extract_json(raw_text)
-
-        # Enforce dict contract: json.loads() can return str/list/int when the
-        # model doubly-encodes the JSON object or returns non-object JSON.
-        if isinstance(parsed, str):
-            try:
-                parsed = json.loads(parsed)
-            except Exception as exc:
-                raise ValueError(f"LLM returned non-object JSON string: {exc}")
-        if not isinstance(parsed, dict):
-            raise ValueError(f"LLM returned non-dict JSON: {type(parsed).__name__}")
-
-        return parsed
-
-    async def _call(
-        self,
-        model: str,
-        system_prompt: str,
-        user_prompt: str,
-        fallback: dict[str, Any],
-        temperature: float = 0.1,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """
-        Internal call wrapper.
-        Returns (result_dict, telemetry_dict).
-        On failure returns (fallback, fallback_telemetry).
-
-        Cache behaviour
-        ───────────────
-        Before calling the API, checks the in-process prompt cache.
-        Cache key = md5(model + system_prompt + user_prompt).
-        A hit returns the stored (result, telemetry) with cache_hit=True
-        and zero additional latency. A miss calls the API through the circuit
-        breaker and stores the result for future hits.
-        """
-        if not settings.OPENROUTER_API_KEY:
-            logger.warning("OPENROUTER_API_KEY not set — returning fallback")
-            return fallback, {**_FALLBACK_TELEMETRY, "error": "API key not configured", "cache_hit": False}
-
-        # ── cache check ───────────────────────────────────────────────────────
-        cache_key = _prompt_cache_key(model, system_prompt, user_prompt)
-        if cache_key in _LLM_CACHE:
-            _LLM_CACHE.move_to_end(cache_key)  # LRU: mark as recently used
-            cached_result, cached_telem = _LLM_CACHE[cache_key]
-            hit_telem = {**cached_telem, "cache_hit": True, "latency_ms": 0.0}
-            _PIPELINE_LOG.info(json.dumps({
-                "event": "llm_cache_hit",
-                "model": model,
-                "cache_key": cache_key[:8],
-            }))
-            return cached_result, hit_telem
-
         t0 = time.monotonic()
         try:
-            parsed = await llm_circuit_breaker.execute(
-                self._do_api_call,
-                model,
-                system_prompt,
-                user_prompt,
-                temperature,
+            response = await self._get_client().chat.completions.create(
+                model=settings.LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                timeout=timeout,
             )
-        except CircuitBreakerOpen:
-            _PIPELINE_LOG.warning(json.dumps({
-                "event": "llm_circuit_breaker_open",
-                "model": model,
-                "cache_hit": False,
-            }))
-            return fallback, {
-                **_FALLBACK_TELEMETRY,
-                "error": "Circuit breaker OPEN",
-                "circuit_breaker": "OPEN",
-                "cache_hit": False,
-            }
+        except APITimeoutError as exc:
+            duration_ms = (time.monotonic() - t0) * 1000
+            _log_llm_call(
+                agent=agent,
+                status="timeout",
+                duration_ms=duration_ms,
+                error=f"timeout: {exc}",
+            )
+            raise LLMTimeout(f"LLM request timed out: {exc}") from exc
+        except (APIConnectionError, APIStatusError) as exc:
+            duration_ms = (time.monotonic() - t0) * 1000
+            _log_llm_call(
+                agent=agent,
+                status="api_error",
+                duration_ms=duration_ms,
+                error=f"api_error: {exc}",
+            )
+            raise LLMAPIError(f"LLM API error: {exc}") from exc
         except Exception as exc:
-            error_msg = str(exc) or f"{type(exc).__name__} (no message)"
-            logger.warning("OpenRouter error: %s", error_msg)
-            _PIPELINE_LOG.warning(json.dumps({
-                "event": "llm_error",
-                "error": error_msg,
-                "model": model,
-            }))
-            return fallback, {**_FALLBACK_TELEMETRY, "error": str(exc), "cache_hit": False}
+            duration_ms = (time.monotonic() - t0) * 1000
+            _log_llm_call(
+                agent=agent,
+                status="api_error",
+                duration_ms=duration_ms,
+                error=f"unexpected: {exc}",
+            )
+            raise LLMAPIError(f"Unexpected LLM error: {exc}") from exc
 
-        latency_ms = (time.monotonic() - t0) * 1000
+        duration_ms = (time.monotonic() - t0) * 1000
+        message = response.choices[0].message if response.choices else None
+        content = message.content if message else None
 
-        telemetry: dict[str, Any] = {
-            "model": model,
-            "latency_ms": round(latency_ms, 1),
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "fallback_used": False,
-            "cache_hit": False,
-            "circuit_breaker": "CLOSED",
-        }
+        if not content:
+            _log_llm_call(
+                agent=agent,
+                status="empty",
+                duration_ms=duration_ms,
+                usage=response.usage,
+            )
+            raise LLMEmpty("LLM returned empty content")
 
-        # ── store in cache ────────────────────────────────────────────────────
-        if len(_LLM_CACHE) >= _LLM_CACHE_MAX:
-            _LLM_CACHE.popitem(last=False)  # evict oldest entry
-        _LLM_CACHE[cache_key] = (parsed, telemetry)
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as exc:
+            _log_llm_call(
+                agent=agent,
+                status="json_error",
+                duration_ms=duration_ms,
+                error=f"json_error: {exc}",
+                usage=response.usage,
+            )
+            raise LLMJSONError(f"LLM returned invalid JSON: {exc}") from exc
 
-        # ── structured log ────────────────────────────────────────────────────
-        _PIPELINE_LOG.info(json.dumps({
-            "event": "llm_call",
-            "model": model,
-            "latency_ms": telemetry["latency_ms"],
-            "input_tokens": telemetry["input_tokens"],
-            "output_tokens": telemetry["output_tokens"],
-            "cache_hit": False,
-            "cache_key": cache_key[:8],
-        }))
+        if not isinstance(parsed, dict):
+            _log_llm_call(
+                agent=agent,
+                status="json_error",
+                duration_ms=duration_ms,
+                error="top-level JSON is not an object",
+                usage=response.usage,
+            )
+            raise LLMJSONError("LLM returned non-object JSON")
 
-        return parsed, telemetry
+        _log_llm_call(
+            agent=agent,
+            status="success",
+            duration_ms=duration_ms,
+            usage=response.usage,
+        )
+        return parsed
 
-    async def generate_diagnosis(self, prompt: str) -> dict[str, Any]:
+    async def call_with_tools(
+        self,
+        *,
+        agent: str,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        timeout: float | None = None,
+    ) -> ToolCallResult:
         """
-        Call settings.LLM_MODEL and return structured root cause analysis.
+        Native tool-calling. Returns either a tool_call or a final text response.
 
-        Returns dict with keys:
-            root_cause, failure_mode, reasoning, confidence, evidence_used, _telemetry
-
-        Always returns a complete dict — falls back to deterministic values on failure.
+        Raises LLMTimeout, LLMEmpty, or LLMAPIError.
         """
-        raw, telemetry = await self._call(
-            model=settings.LLM_MODEL,
-            system_prompt=_DIAGNOSIS_SYSTEM,
-            user_prompt=prompt,
-            fallback=dict(_DIAGNOSIS_FALLBACK),
-            temperature=0.1,
+        t0 = time.monotonic()
+        full_messages = [{"role": "system", "content": system}, *messages]
+
+        try:
+            response = await self._get_client().chat.completions.create(
+                model=settings.LLM_MODEL,
+                messages=full_messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.1,
+                timeout=timeout,
+            )
+        except APITimeoutError as exc:
+            duration_ms = (time.monotonic() - t0) * 1000
+            _log_llm_call(
+                agent=agent,
+                status="timeout",
+                duration_ms=duration_ms,
+                error=f"timeout: {exc}",
+            )
+            raise LLMTimeout(f"LLM request timed out: {exc}") from exc
+        except (APIConnectionError, APIStatusError) as exc:
+            duration_ms = (time.monotonic() - t0) * 1000
+            _log_llm_call(
+                agent=agent,
+                status="api_error",
+                duration_ms=duration_ms,
+                error=f"api_error: {exc}",
+            )
+            raise LLMAPIError(f"LLM API error: {exc}") from exc
+        except Exception as exc:
+            duration_ms = (time.monotonic() - t0) * 1000
+            _log_llm_call(
+                agent=agent,
+                status="api_error",
+                duration_ms=duration_ms,
+                error=f"unexpected: {exc}",
+            )
+            raise LLMAPIError(f"Unexpected LLM error: {exc}") from exc
+
+        duration_ms = (time.monotonic() - t0) * 1000
+        message = response.choices[0].message if response.choices else None
+        if message is None:
+            _log_llm_call(
+                agent=agent,
+                status="empty",
+                duration_ms=duration_ms,
+                usage=response.usage,
+            )
+            raise LLMEmpty("LLM returned no choices")
+
+        content = message.content or ""
+        raw_tool_calls = getattr(message, "tool_calls", None) or []
+
+        if not raw_tool_calls:
+            _log_llm_call(
+                agent=agent,
+                status="success",
+                duration_ms=duration_ms,
+                usage=response.usage,
+            )
+            return ToolCallResult(
+                kind="final",
+                content=content,
+                tool_call_id=None,
+            )
+
+        first = raw_tool_calls[0]
+        tool_call_id = getattr(first, "id", None) or f" synthetic-{uuid.uuid4().hex[:8]}"
+        tool_name = getattr(first.function, "name", None)
+        arguments = getattr(first.function, "arguments", "{}")
+
+        try:
+            tool_args = json.loads(arguments) if arguments else {}
+        except json.JSONDecodeError as exc:
+            # Tool arguments are supposed to be valid JSON by OpenAI spec.
+            # If the LLM violates this, treat it as an API-level error.
+            _log_llm_call(
+                agent=agent,
+                status="api_error",
+                duration_ms=duration_ms,
+                error=f"tool_args_not_json: {exc}",
+                usage=response.usage,
+                tool_calls=len(raw_tool_calls),
+            )
+            raise LLMAPIError(f"Tool call arguments were not valid JSON: {exc}") from exc
+
+        _log_llm_call(
+            agent=agent,
+            status="success",
+            duration_ms=duration_ms,
+            usage=response.usage,
+            tool_calls=len(raw_tool_calls),
+        )
+        return ToolCallResult(
+            kind="tool_call",
+            tool_name=tool_name,
+            tool_args=tool_args,
+            content=content,
+            tool_call_id=tool_call_id,
         )
 
-        confidence = raw.get("confidence", _DIAGNOSIS_FALLBACK["confidence"])
+    async def call_text(
+        self,
+        *,
+        agent: str,
+        system: str,
+        user: str,
+        timeout: float | None = None,
+    ) -> str:
+        """Plain text completion. Returns the assistant's content string."""
+        t0 = time.monotonic()
         try:
-            confidence = float(confidence)
-        except (TypeError, ValueError):
-            confidence = _DIAGNOSIS_FALLBACK["confidence"]
-        confidence = max(0.0, min(1.0, confidence))
-
-        root_cause   = raw.get("root_cause")   or _DIAGNOSIS_FALLBACK["root_cause"]
-        failure_mode = raw.get("failure_mode") or "unspecified"
-        reasoning    = raw.get("reasoning")    or _REASONING_UNAVAILABLE
-
-        # Preserve the LLM's diagnosis. A downstream uncertainty guard in
-        # graph_builder._finalize_node decides whether to collapse to fallback
-        # text based on confidence, verification, and evidence availability.
-        # This service only enforces sane bounds and valid JSON shape.
-        if confidence < 0.5 and root_cause != "manual inspection required":
-            logger.info(
-                "Diagnosis confidence %.2f is low but not forcing fallback; "
-                "downstream finalizer will decide (was: %r)",
-                confidence,
-                root_cause,
+            response = await self._get_client().chat.completions.create(
+                model=settings.LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.2,
+                timeout=timeout,
             )
+        except APITimeoutError as exc:
+            duration_ms = (time.monotonic() - t0) * 1000
+            _log_llm_call(
+                agent=agent,
+                status="timeout",
+                duration_ms=duration_ms,
+                error=f"timeout: {exc}",
+            )
+            raise LLMTimeout(f"LLM request timed out: {exc}") from exc
+        except (APIConnectionError, APIStatusError) as exc:
+            duration_ms = (time.monotonic() - t0) * 1000
+            _log_llm_call(
+                agent=agent,
+                status="api_error",
+                duration_ms=duration_ms,
+                error=f"api_error: {exc}",
+            )
+            raise LLMAPIError(f"LLM API error: {exc}") from exc
+        except Exception as exc:
+            duration_ms = (time.monotonic() - t0) * 1000
+            _log_llm_call(
+                agent=agent,
+                status="api_error",
+                duration_ms=duration_ms,
+                error=f"unexpected: {exc}",
+            )
+            raise LLMAPIError(f"Unexpected LLM error: {exc}") from exc
 
-        return {
-            "root_cause":    root_cause,
-            "failure_mode":  failure_mode,
-            "reasoning":     reasoning,
-            "confidence":    confidence,
-            "evidence_used": raw.get("evidence_used") or [],
-            "_telemetry":    telemetry,
-        }
+        duration_ms = (time.monotonic() - t0) * 1000
+        message = response.choices[0].message if response.choices else None
+        content = message.content if message else None
+
+        if not content:
+            _log_llm_call(
+                agent=agent,
+                status="empty",
+                duration_ms=duration_ms,
+                usage=response.usage,
+            )
+            raise LLMEmpty("LLM returned empty content")
+
+        _log_llm_call(
+            agent=agent,
+            status="success",
+            duration_ms=duration_ms,
+            usage=response.usage,
+        )
+        return content
+
+    # ── convenience wrappers for legacy callers ─────────────────────────────────
 
     async def generate_role_reports(self, prompt: str) -> dict[str, Any]:
-        """
-        Call settings.LLM_MODEL and return three role-specific summaries.
-
-        Returns dict with keys:
-            engineer, supervisor, manager, _telemetry
-
-        Always returns a complete dict — falls back to deterministic values on failure.
-        """
-        raw, telemetry = await self._call(
-            model=settings.LLM_MODEL,
-            system_prompt=_COMMUNICATION_SYSTEM,
-            user_prompt=prompt,
-            fallback=dict(_COMMUNICATION_FALLBACK),
-            temperature=0.2,
+        """Legacy wrapper: JSON role reports (engineer/supervisor/manager)."""
+        system = (
+            "You are a senior reliability engineer writing operational reports for an industrial plant. "
+            "Respond ONLY with valid JSON. No prose, no markdown fences, no explanation outside the JSON object.\n"
+            "Each summary must be 150-200 words, specific, factual, and grounded in the evidence provided.\n"
+            'Required schema: {"engineer":"<string>","supervisor":"<string>","manager":"<string>"}\n\n'
+            "REPORT RULES:\n"
+            "- Use concrete component/system names and sensor values from the investigation summary.\n"
+            "- Cite evidence briefly (e.g., 'vibration 12% above threshold', 'manual states inspect seal every 2000h').\n"
+            "- Do NOT use generic filler such as 'further investigation is needed' unless the summary explicitly states low confidence or manual inspection.\n"
+            "- Do NOT invent failures, costs, or timelines not present in the data.\n"
+            "- engineer: field engineer performing the repair — fault description, first checks, parts, safety, post-repair monitoring.\n"
+            "- supervisor: shift supervisor coordinating the response — operational impact, resource needs, timeline, escalation.\n"
+            "- manager: plant management — business risk, cost exposure, compliance, strategic recommendation."
         )
+        try:
+            raw = await self.call_json(
+                agent="communication_agent",
+                system=system,
+                user=prompt,
+            )
+        except LLMError:
+            return {**_COMMUNICATION_FALLBACK, "_telemetry": {"fallback_used": True}}
 
         return {
-            "engineer":   _to_str(raw.get("engineer"),   _COMMUNICATION_FALLBACK["engineer"]),
+            "engineer": _to_str(raw.get("engineer"), _COMMUNICATION_FALLBACK["engineer"]),
             "supervisor": _to_str(raw.get("supervisor"), _COMMUNICATION_FALLBACK["supervisor"]),
-            "manager":    _to_str(raw.get("manager"),    _COMMUNICATION_FALLBACK["manager"]),
-            "_telemetry": telemetry,
+            "manager": _to_str(raw.get("manager"), _COMMUNICATION_FALLBACK["manager"]),
+            "_telemetry": {"fallback_used": False},
         }
 
+    async def call_structured(
+        self,
+        *,
+        agent: str,
+        system: str,
+        user: str,
+        schema: type[_ModelT],
+        timeout: float | None = None,
+    ) -> _ModelT:
+        """call_json + Pydantic model_validate for type-safe structured output.
+
+        Works with any OpenAI-compatible endpoint (including Ollama) without
+        requiring the beta.chat.completions.parse API.
+        Raises LLMError (or subclass) on LLM failure, ValidationError on schema mismatch.
+        """
+        raw = await self.call_json(agent=agent, system=system, user=user, timeout=timeout)
+        return schema.model_validate(raw)
 
     async def generate_copilot_answer(self, machine_facts: str, question: str) -> str:
-        """
-        Generate a short (1-2 sentence) copilot answer for a specific operator question.
-        Input is structured machine data; output is a grounded plain-English sentence.
-        Falls back to empty string on failure (caller handles gracefully).
-        """
-        prompt = f"Machine data:\n{machine_facts}\n\nOperator question: {question}"
-        raw, _ = await self._call(
-            model=settings.LLM_MODEL,
-            system_prompt=_COPILOT_SYSTEM,
-            user_prompt=prompt,
-            fallback={"answer": ""},
-            temperature=0.1,
+        """Legacy wrapper: short grounded answer for the chat copilot."""
+        system = (
+            "You are an industrial reliability copilot. "
+            "Answer the operator's question using ONLY the machine data provided. "
+            "Be concise: 1-2 sentences. Plain English. No bullet points. "
+            "Never invent failures, root causes, or sensor values not present in the data. "
+            "If the answer is not in the data, say so directly.\n"
+            'Required schema: {"answer": "<string>"}'
         )
+        prompt = f"Machine data:\n{machine_facts}\n\nOperator question: {question}"
+        try:
+            raw = await self.call_json(
+                agent="copilot",
+                system=system,
+                user=prompt,
+            )
+        except LLMError:
+            return ""
         return _to_str(raw.get("answer"), "")
 
 
+def _to_str(value: Any, fallback: str = "") -> str:
+    """Coerce an LLM field value to a plain string."""
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("text", "report", "summary", "content", "message", "body", "narrative"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+        parts = [str(v) for v in value.values() if v is not None and str(v).strip()]
+        return " ".join(parts) if parts else fallback
+    return str(value)
+
+
 # Module-level singleton — one AsyncOpenAI client per process
-llm_service = OpenRouterLLMService()
+llm_service = LLMService()

@@ -21,6 +21,8 @@ Returns
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 from datetime import datetime
 from typing import Any
@@ -53,11 +55,19 @@ _RANK_TO_PRIORITY: dict[str, MaintenancePriority] = {
 
 
 def _call(agent_module: Any, state: VulcanOpsState) -> tuple[AgentResult, dict[str, Any]]:
-    """Invoke a synchronous agent, catch exceptions, return (result, trace_entry)."""
+    """Invoke an agent (sync or async), catch exceptions, return (result, trace_entry)."""
     agent_name = agent_module.__name__.rsplit(".", 1)[-1]
     start = now_utc()
     try:
-        result: AgentResult = agent_module.run(state)
+        maybe_coro = agent_module.run(state)
+        if inspect.isawaitable(maybe_coro):
+            loop = asyncio.new_event_loop()
+            try:
+                result: AgentResult = loop.run_until_complete(maybe_coro)
+            finally:
+                loop.close()
+        else:
+            result = maybe_coro
     except Exception as exc:
         logger.warning("Fast agent %s raised: %s", agent_name, exc)
         result = AgentResult(status="error", data={}, errors=[str(exc)])

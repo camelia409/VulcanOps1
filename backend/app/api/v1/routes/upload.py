@@ -24,6 +24,7 @@ from app.services.sensor_ingestion_service import (
     delete_sensor_file,
     ingest_sensor_readings,
 )
+from app.services.spares_ingestion_service import ingest_spares
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 
@@ -95,6 +96,17 @@ async def upload_manuals(
     _require_pdf(file)
     content = await _read_limited(file, _MAX_PDF_BYTES)
     return await ingest_manual(content, file.filename, db)
+
+
+@router.post("/spares", response_model=UploadResponse)
+async def upload_spares(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+) -> UploadResponse:
+    """Upload a CSV of spare parts to upsert into inventory."""
+    _require_csv(file)
+    content = await _read_limited(file, _MAX_CSV_BYTES)
+    return await ingest_spares(content, file.filename or "spares.csv", db)
 
 
 @router.post("/sops", response_model=UploadResponse)

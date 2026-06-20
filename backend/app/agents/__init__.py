@@ -8,6 +8,7 @@ from app.agents import (
     operational_impact_agent,
     plant_priority_agent,
     prognostics_agent,
+    supervisor_agent,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "operational_impact_agent",
     "plant_priority_agent",
     "prognostics_agent",
+    "supervisor_agent",
 ]

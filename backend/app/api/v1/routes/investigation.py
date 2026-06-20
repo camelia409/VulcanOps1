@@ -46,9 +46,10 @@ async def system_status(
         }
 
     base["llm"] = {
-        "provider": "OpenRouter",
+        "provider": "ollama",
         "model": settings.LLM_MODEL,
-        "api_key_configured": bool(settings.OPENROUTER_API_KEY),
-        "timeout_s": settings.LLM_TIMEOUT,
+        "api_key_configured": bool(settings.LLM_API_KEY),
+        "base_url": settings.LLM_BASE_URL,
+        "timeout_s": settings.LLM_TIMEOUT_SECONDS,
     }
     return base

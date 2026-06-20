@@ -75,8 +75,12 @@ def build_single_report(state: VulcanOpsState) -> dict[str, Any]:
     verification_block: dict | None = None
     if state.verification:
         verification_block = {
-            "verified":           state.verification.verified,
-            "verification_notes": state.verification.verification_notes,
+            "verified":                  state.verification.verified,
+            "verification_notes":        state.verification.verification_notes,
+            "contradictions":            state.verification.contradictions,
+            "evidence_score":            state.verification.evidence_score,
+            "history_score":             state.verification.history_score,
+            "combined_score":            state.verification.combined_score,
         }
 
     engineer_text = (
@@ -109,15 +113,26 @@ def build_single_report(state: VulcanOpsState) -> dict[str, Any]:
         "rul_hours":            state.rul_prediction.remaining_useful_life_hours if state.rul_prediction else None,
         "estimated_downtime_hours": state.impact.estimated_downtime_hours if state.impact else None,
         "estimated_cost_usd":   state.impact.estimated_cost_usd if state.impact else None,
-        "parts_required":       state.strategy.parts_required if state.strategy else [],
+        "parts_required":           state.strategy.parts_required if state.strategy else [],
+        "procurement_strategy":     state.strategy.procurement_strategy if state.strategy else None,
+        "constraint_violations":    state.strategy.constraint_violations if state.strategy else [],
         "anomaly":              anomaly_block,
         "verification":         verification_block,
         "engineer_report":      engineer_text,
         "supervisor_report":    supervisor_text,
         "manager_report":       manager_text,
         "execution_trace":      state.execution_trace,
+        "execution_plan":       state.execution_plan.model_dump() if state.execution_plan else None,
         "pipeline_errors":      len(state.errors),
         "has_errors":           len(state.errors) > 0,
+        "diagnosis": {
+            "root_cause":      state.diagnosis.root_cause if state.diagnosis else None,
+            "failure_mode":    state.diagnosis.failure_mode if state.diagnosis else None,
+            "confidence":      state.diagnosis.confidence if state.diagnosis else None,
+            "reasoning_trace": [
+                step.model_dump() for step in state.diagnosis.reasoning_trace
+            ] if state.diagnosis else [],
+        },
         # Quality telemetry so the UI can explain why a report is specific/cautious/fallback
         "evidence_score":       telemetry.get("evidence_score"),
         "history_score":        telemetry.get("history_score"),
@@ -129,6 +144,20 @@ def build_single_report(state: VulcanOpsState) -> dict[str, Any]:
         "evidence_chain": telemetry.get("evidence_chain"),
         "explainability_score": telemetry.get("explainability_score"),
         "procurement_gap": telemetry.get("procurement_gap"),
+        # Prior feedback injected into diagnosis
+        "prior_feedback_considered": [
+            {
+                "verdict": fb.get("verdict"),
+                "actual_root_cause": fb.get("actual_root_cause"),
+                "notes": fb.get("notes"),
+                "failure_mode": fb.get("failure_mode"),
+            }
+            for fb in state.prior_feedback
+        ],
+        # Verification cycle telemetry
+        "verification_contradictions":  telemetry.get("verification_contradictions", []),
+        "verification_revision_count":  telemetry.get("verification_revision_count", 0),
+        "verification_recommendation":  state.verification_recommendation,
     }
 
 

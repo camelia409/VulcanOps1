@@ -1,4 +1,5 @@
 from app.models.chat_message import ChatMessage
+from app.models.engineer_feedback import EngineerFeedback
 from app.models.document_chunk import DocumentChunk
 from app.models.deep_analysis_job import DeepAnalysisJob
 from app.models.ingested_file import IngestedFile
@@ -7,10 +8,12 @@ from app.models.machine import Machine
 from app.models.maintenance_record import MaintenanceRecord
 from app.models.report_batch import ReportBatch
 from app.models.sensor_reading import SensorReading
+from app.models.spare_part import SparePart
 from app.models.stored_role_report import StoredRoleReport
 
 __all__ = [
     "ChatMessage",
+    "EngineerFeedback",
     "DocumentChunk",
     "DeepAnalysisJob",
     "IngestedFile",
@@ -19,5 +22,6 @@ __all__ = [
     "MaintenanceRecord",
     "ReportBatch",
     "SensorReading",
+    "SparePart",
     "StoredRoleReport",
 ]

@@ -54,6 +54,10 @@ def _sanitize_uncertain_text(text: str) -> str:
     """Replace certainty-claim phrasing that contradicts an uncertain diagnosis."""
     return _UNCERTAINTY_PATTERN.sub("[pending investigation]", text)
 
+# Alert thresholds — module constants so they appear in a single searchable place
+_CRITICAL_DEVIATION_THRESHOLD = 50.0   # % above threshold → critical_anomaly alert
+_LOW_RUL_THRESHOLD_HOURS = 48.0        # hours remaining → low_rul alert
+
 from langgraph.graph import END, START, StateGraph
 
 from app.agents import (
@@ -66,14 +70,17 @@ from app.agents import (
     operational_impact_agent,
     plant_priority_agent,
     prognostics_agent,
+    supervisor_agent,
 )
 from app.agents.base import AgentResult
 from app.core.enums import MaintenancePriority, RiskLevel
 from app.core.state_contract import (
     AnomalyDetail,
     DiagnosisResult,
+    ExecutionPlan,
     ImpactAssessment,
     LLMTelemetry,
+    ReActStep,
     RoleReports,
     RULPrediction,
     StrategyDecision,
@@ -82,16 +89,6 @@ from app.core.state_contract import (
 )
 from app.orchestrator.execution_trace import build_trace, now_utc, skipped_trace
 from app.schemas.report import EngineerReport, ManagerReport, SupervisorReport
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-
-def _append_trace(state: VulcanOpsState, trace: dict) -> list[dict[str, Any]]:
-    return state.execution_trace + [trace]
-
-
-def _append_error(state: VulcanOpsState, agent: str, errors: list[str]) -> list[dict[str, Any]]:
-    return state.errors + [{"agent": agent, "errors": errors}]
 
 
 def _trace_node(name: str, fn):
@@ -153,6 +150,108 @@ def _merge_llm_telemetry(state: VulcanOpsState, raw: dict) -> LLMTelemetry:
     )
 
 
+# ── node: supervisor ──────────────────────────────────────────────────────────
+
+
+async def _supervisor_node(state: VulcanOpsState) -> dict:
+    """First node: decide which agents to run."""
+    start = now_utc()
+    try:
+        result: AgentResult = await supervisor_agent.run(state)
+    except Exception as exc:
+        logger.exception("supervisor_agent raised unexpectedly: %s", exc)
+        result = AgentResult(status="error", data={}, errors=[str(exc)])
+    end = now_utc()
+
+    trace = build_trace("supervisor_agent", start, end, result.status,
+                        llm_called=True)
+
+    if result.status == "error":
+        # Fall back to the full pipeline so a supervisor failure never blocks analysis.
+        fallback_plan = ExecutionPlan(
+            stages=[
+                "anomaly", "prognostics", "evidence_retrieval", "diagnosis",
+                "evidence_verification", "operational_impact", "maintenance_strategy",
+                "plant_priority", "communication",
+            ],
+            skipped={},
+            rationale="Supervisor failed — falling back to full pipeline.",
+        )
+        return {
+            "execution_plan": fallback_plan,
+            "execution_trace": [trace],
+            "errors": [{"agent": "supervisor_agent", "errors": result.errors}],
+        }
+
+    plan_data = result.data.get("execution_plan") or {}
+    plan = ExecutionPlan(
+        stages=plan_data.get("stages", []),
+        skipped=plan_data.get("skipped", {}),
+        rationale=plan_data.get("rationale", ""),
+    )
+
+    return {
+        "execution_plan": plan,
+        "execution_trace": [trace],
+    }
+
+
+# ── conditional routing ───────────────────────────────────────────────────────
+
+_ANALYTICAL_ORDER = [
+    "anomaly_agent",
+    "prognostics_agent",
+    "evidence_retrieval_agent",
+    "diagnosis_agent",
+    "evidence_verification_agent",
+    "operational_impact_agent",
+    "maintenance_strategy_agent",
+    "plant_priority_agent",
+]
+
+
+def _next_active_after(state: VulcanOpsState, current: str) -> str:
+    """Return the next enabled analytical stage after `current`.
+
+    Falls through to 'communication_agent' when no more analytical stages remain.
+    Skips nodes whose invariant preconditions cannot be satisfied even if the
+    supervisor plan includes them (belt-and-suspenders).
+    """
+    plan_stages = (
+        state.execution_plan.stages if state.execution_plan else _ANALYTICAL_ORDER
+    )
+    try:
+        start_idx = _ANALYTICAL_ORDER.index(current) + 1
+    except ValueError:
+        start_idx = 0
+
+    for node_name in _ANALYTICAL_ORDER[start_idx:]:
+        stage_key = node_name.replace("_agent", "")
+        if stage_key not in plan_stages:
+            continue
+        if node_name == "diagnosis_agent" and state.anomaly is None:
+            continue
+        if node_name == "evidence_verification_agent" and state.diagnosis is None:
+            continue
+        return node_name
+
+    return "communication_agent"
+
+
+# ── verification cycle routing ────────────────────────────────────────────────
+
+_MAX_VERIFICATION_REVISIONS = 1
+
+
+def _route_after_verification(state: VulcanOpsState) -> str:
+    """Route forward normally, OR back to diagnosis_agent if a strong contradiction was found."""
+    rec = state.verification_recommendation or "accept"
+    revisions = state.verification_revision_count
+    if rec == "revise_diagnosis" and revisions < _MAX_VERIFICATION_REVISIONS:
+        return "diagnosis_agent"
+    return _next_active_after(state, current="evidence_verification_agent")
+
+
 # ── node: anomaly ─────────────────────────────────────────────────────────────
 
 
@@ -168,8 +267,8 @@ async def _anomaly_node(state: VulcanOpsState) -> dict:
 
     if result.status == "error":
         return {
-            "execution_trace": _append_trace(state, trace),
-            "errors": _append_error(state, "anomaly_agent", result.errors),
+            "execution_trace": [trace],
+            "errors": [{"agent": "anomaly_agent", "errors": result.errors}],
         }
 
     d = result.data
@@ -183,9 +282,28 @@ async def _anomaly_node(state: VulcanOpsState) -> dict:
         deviation_percent=primary["deviation_percent"] if primary else None,
         detected_at=datetime.fromisoformat(primary["detected_at"]) if primary else None,
     )
+
+    # Publish critical-anomaly alert when deviation exceeds threshold
+    if primary and primary.get("deviation_percent", 0) > _CRITICAL_DEVIATION_THRESHOLD:
+        try:
+            from app.services.alert_bus import get_alert_bus, make_critical_anomaly_alert
+            machine_name = (
+                state.machine_context.machine_name if state.machine_context else None
+            )
+            alert = make_critical_anomaly_alert(
+                machine_id=str(state.active_machine_id),
+                machine_name=machine_name,
+                sensor=primary["sensor"],
+                value=primary["value"],
+                deviation_percent=primary["deviation_percent"],
+            )
+            get_alert_bus().publish(alert)
+        except Exception as _ae:
+            logger.warning("alert_bus publish (anomaly) failed: %s", _ae)
+
     return {
         "anomaly": anomaly,
-        "execution_trace": _append_trace(state, trace),
+        "execution_trace": [trace],
     }
 
 
@@ -204,19 +322,38 @@ async def _prognostics_node(state: VulcanOpsState) -> dict:
 
     if result.status == "error":
         return {
-            "execution_trace": _append_trace(state, trace),
-            "errors": _append_error(state, "prognostics_agent", result.errors),
+            "execution_trace": [trace],
+            "errors": [{"agent": "prognostics_agent", "errors": result.errors}],
         }
 
     d = result.data
+    hours_remaining = d.get("hours_remaining")
     rul = RULPrediction(
-        remaining_useful_life_hours=d.get("hours_remaining"),
+        remaining_useful_life_hours=hours_remaining,
         confidence=d.get("confidence"),
         basis=d.get("basis"),
     )
+
+    # Publish low-RUL alert when estimated life drops below threshold
+    if hours_remaining is not None and hours_remaining < _LOW_RUL_THRESHOLD_HOURS:
+        try:
+            from app.services.alert_bus import get_alert_bus, make_low_rul_alert
+            machine_name = (
+                state.machine_context.machine_name if state.machine_context else None
+            )
+            alert = make_low_rul_alert(
+                machine_id=str(state.active_machine_id),
+                machine_name=machine_name,
+                hours_remaining=hours_remaining,
+                basis=d.get("basis", "sensor extrapolation"),
+            )
+            get_alert_bus().publish(alert)
+        except Exception as _re:
+            logger.warning("alert_bus publish (rul) failed: %s", _re)
+
     return {
         "rul_prediction": rul,
-        "execution_trace": _append_trace(state, trace),
+        "execution_trace": [trace],
     }
 
 
@@ -235,13 +372,13 @@ async def _evidence_retrieval_node(state: VulcanOpsState) -> dict:
 
     if result.status == "error":
         return {
-            "execution_trace": _append_trace(state, trace),
-            "errors": _append_error(state, "evidence_retrieval_agent", result.errors),
+            "execution_trace": [trace],
+            "errors": [{"agent": "evidence_retrieval_agent", "errors": result.errors}],
         }
 
     return {
         "retrieved_evidence": result.data.get("retrieved_evidence", []),
-        "execution_trace": _append_trace(state, trace),
+        "execution_trace": [trace],
     }
 
 
@@ -252,14 +389,39 @@ async def _diagnosis_node(state: VulcanOpsState) -> dict:
     # Invariant 1: diagnosis cannot run without anomaly data
     if state.anomaly is None:
         return {
-            "execution_trace": _append_trace(
-                state,
-                skipped_trace(
-                    "diagnosis_agent",
-                    "Invariant 1: state.anomaly is None — anomaly agent did not produce output",
-                ),
-            ),
+            "execution_trace": [skipped_trace(
+                "diagnosis_agent",
+                "Invariant 1: state.anomaly is None — anomaly agent did not produce output",
+            )],
         }
+
+    # Detect re-pass triggered by verification cycle
+    is_repass = state.verification is not None
+    updates: dict[str, Any] = {}
+    if is_repass:
+        new_revision_count = state.verification_revision_count + 1
+        updates["verification_revision_count"] = new_revision_count
+        _PIPELINE_LOG.info(json.dumps({
+            "event": "verification_cycle",
+            "revision_count": new_revision_count,
+            "contradictions_count": len(state.verification_contradictions),
+            "machine_id": str(state.active_machine_id),
+        }))
+
+    # Fetch prior engineer feedback and inject into state before diagnosis
+    try:
+        from app.services.feedback_retrieval import get_relevant_feedback
+        anomaly_sensor = state.anomaly.sensor if state.anomaly else None
+        prior_fb = await get_relevant_feedback(
+            machine_id=state.active_machine_id,
+            failure_mode=anomaly_sensor,
+            limit=5,
+        )
+        if prior_fb:
+            updates["prior_feedback"] = prior_fb
+            state = state.model_copy(update={"prior_feedback": prior_fb})
+    except Exception as _fb_exc:
+        logger.warning("feedback_retrieval failed (non-fatal): %s", _fb_exc)
 
     start = now_utc()
     try:
@@ -290,21 +452,26 @@ async def _diagnosis_node(state: VulcanOpsState) -> dict:
 
     if result.status == "error":
         return {
-            "execution_trace": _append_trace(state, trace),
-            "errors": _append_error(state, "diagnosis_agent", result.errors),
+            "execution_trace": [trace],
+            "errors": [{"agent": "diagnosis_agent", "errors": result.errors}],
         }
+
+    reasoning_trace = [
+        ReActStep(**step) for step in d.get("reasoning_trace", [])
+    ] if d.get("reasoning_trace") else []
 
     diagnosis = DiagnosisResult(
         root_cause=d.get("root_cause") or "",
         failure_mode=d.get("failure_mode") or "",
         confidence=d.get("confidence", 0.5),
         supporting_evidence=d.get("evidence_used", []),
+        reasoning_trace=reasoning_trace,
     )
 
-    updates: dict[str, Any] = {
+    updates.update({
         "diagnosis": diagnosis,
-        "execution_trace": _append_trace(state, trace),
-    }
+        "execution_trace": [trace],
+    })
     if telem:
         updates["llm_telemetry"] = _merge_llm_telemetry(state, telem)
 
@@ -318,42 +485,60 @@ async def _evidence_verification_node(state: VulcanOpsState) -> dict:
     # Invariant 2: cannot verify without a diagnosis
     if state.diagnosis is None:
         return {
-            "execution_trace": _append_trace(
-                state,
-                skipped_trace(
-                    "evidence_verification_agent",
-                    "Invariant 2: state.diagnosis is None — diagnosis agent did not produce output",
-                ),
-            ),
+            "execution_trace": [skipped_trace(
+                "evidence_verification_agent",
+                "Invariant 2: state.diagnosis is None — diagnosis agent did not produce output",
+            )],
         }
 
     start = now_utc()
     try:
-        result: AgentResult = evidence_verification_agent.run(state)
+        result: AgentResult = await evidence_verification_agent.run(state)
     except Exception as exc:
         result = AgentResult(status="error", data={}, errors=[str(exc)])
     end = now_utc()
 
-    trace = build_trace("evidence_verification_agent", start, end, result.status)
+    d = result.data
+    telem: dict = d.get("llm_telemetry") or {}
+    cache_hit = bool(telem.get("cache_hit", False))
+    trace = build_trace("evidence_verification_agent", start, end, result.status,
+                        llm_called=True, cache_hit=cache_hit)
+
+    _PIPELINE_LOG.info(json.dumps({
+        "event":        "llm_call",
+        "agent":        "evidence_verification_agent",
+        "machine_id":   str(state.active_machine_id),
+        "model":        telem.get("model", ""),
+        "iterations":   telem.get("iterations", 0),
+        "status":       result.status,
+    }))
 
     if result.status == "error":
         return {
-            "execution_trace": _append_trace(state, trace),
-            "errors": _append_error(state, "evidence_verification_agent", result.errors),
+            "execution_trace": [trace],
+            "errors": [{"agent": "evidence_verification_agent", "errors": result.errors}],
         }
 
-    d = result.data
+    contradictions_raw: list[str] = d.get("contradictions", [])
+    recommendation: str = d.get("recommendation", "accept")
+
     verification = VerificationResult(
         verified=d["verified"],
         verification_notes=d.get("verification_notes"),
-        contradictions=d.get("warnings", []),
+        contradictions=contradictions_raw,
         evidence_score=d.get("evidence_score", 0.0),
         history_score=d.get("history_score", 0.0),
         combined_score=d.get("combined_score", 0.0),
     )
+
+    # Store contradictions as dicts so diagnosis_agent can render them by key
+    contradictions_dicts = [{"contradiction": c} for c in contradictions_raw]
+
     return {
         "verification": verification,
-        "execution_trace": _append_trace(state, trace),
+        "verification_contradictions": contradictions_dicts,
+        "verification_recommendation": recommendation,
+        "execution_trace": [trace],
     }
 
 
@@ -372,8 +557,8 @@ async def _operational_impact_node(state: VulcanOpsState) -> dict:
 
     if result.status == "error":
         return {
-            "execution_trace": _append_trace(state, trace),
-            "errors": _append_error(state, "operational_impact_agent", result.errors),
+            "execution_trace": [trace],
+            "errors": [{"agent": "operational_impact_agent", "errors": result.errors}],
         }
 
     d = result.data
@@ -387,7 +572,7 @@ async def _operational_impact_node(state: VulcanOpsState) -> dict:
     )
     return {
         "impact": impact,
-        "execution_trace": _append_trace(state, trace),
+        "execution_trace": [trace],
     }
 
 
@@ -397,7 +582,7 @@ async def _operational_impact_node(state: VulcanOpsState) -> dict:
 async def _maintenance_strategy_node(state: VulcanOpsState) -> dict:
     start = now_utc()
     try:
-        result: AgentResult = maintenance_strategy_agent.run(state)
+        result: AgentResult = await maintenance_strategy_agent.run(state)
     except Exception as exc:
         result = AgentResult(status="error", data={}, errors=[str(exc)])
     end = now_utc()
@@ -406,8 +591,8 @@ async def _maintenance_strategy_node(state: VulcanOpsState) -> dict:
 
     if result.status == "error":
         return {
-            "execution_trace": _append_trace(state, trace),
-            "errors": _append_error(state, "maintenance_strategy_agent", result.errors),
+            "execution_trace": [trace],
+            "errors": [{"agent": "maintenance_strategy_agent", "errors": result.errors}],
         }
 
     d = result.data
@@ -418,10 +603,12 @@ async def _maintenance_strategy_node(state: VulcanOpsState) -> dict:
         parts_required=d.get("parts_required", []),
         safety_notes=d.get("safety_notes"),
         resource_requirements=d.get("resource_requirements"),
+        procurement_strategy=d.get("procurement_strategy"),
+        constraint_violations=d.get("constraint_violations", []),
     )
     return {
         "strategy": strategy,
-        "execution_trace": _append_trace(state, trace),
+        "execution_trace": [trace],
     }
 
 
@@ -440,8 +627,8 @@ async def _plant_priority_node(state: VulcanOpsState) -> dict:
 
     if result.status == "error":
         return {
-            "execution_trace": _append_trace(state, trace),
-            "errors": _append_error(state, "plant_priority_agent", result.errors),
+            "execution_trace": [trace],
+            "errors": [{"agent": "plant_priority_agent", "errors": result.errors}],
         }
 
     d = result.data
@@ -454,7 +641,7 @@ async def _plant_priority_node(state: VulcanOpsState) -> dict:
     priority = rank_to_priority.get(d.get("priority_rank", "P3"), MaintenancePriority.SCHEDULED)
     return {
         "priority": priority,
-        "execution_trace": _append_trace(state, trace),
+        "execution_trace": [trace],
     }
 
 
@@ -465,13 +652,10 @@ async def _communication_node(state: VulcanOpsState) -> dict:
     # Invariant 3: communication requires strategy to exist
     if state.strategy is None:
         return {
-            "execution_trace": _append_trace(
-                state,
-                skipped_trace(
-                    "communication_agent",
-                    "Invariant 3: state.strategy is None — cannot generate role reports without strategy",
-                ),
-            ),
+            "execution_trace": [skipped_trace(
+                "communication_agent",
+                "Invariant 3: state.strategy is None — cannot generate role reports without strategy",
+            )],
         }
 
     start = now_utc()
@@ -503,8 +687,8 @@ async def _communication_node(state: VulcanOpsState) -> dict:
 
     if result.status == "error":
         return {
-            "execution_trace": _append_trace(state, trace),
-            "errors": _append_error(state, "communication_agent", result.errors),
+            "execution_trace": [trace],
+            "errors": [{"agent": "communication_agent", "errors": result.errors}],
         }
 
     now = datetime.now(timezone.utc)
@@ -565,7 +749,7 @@ async def _communication_node(state: VulcanOpsState) -> dict:
 
     updates: dict[str, Any] = {
         "role_reports": role_reports,
-        "execution_trace": _append_trace(state, trace),
+        "execution_trace": [trace],
     }
     if telem := d.get("llm_telemetry"):
         updates["llm_telemetry"] = _merge_llm_telemetry(state, telem)
@@ -622,17 +806,6 @@ def _classify_report(
 
 
 # ── explainability & procurement gap helpers ──────────────────────────────────
-
-# Part → typical procurement lead time in days.
-# Keys are written as human-readable phrases; matching normalises underscores
-# so "thermal gasket" matches both key and free-text part descriptions.
-_PROCUREMENT_LEAD_TIMES = {
-    "bearing": 21,
-    "coupling": 14,
-    "lubricant": 3,
-    "oil": 3,
-    "thermal gasket": 10,
-}
 
 
 def _build_evidence_chain(state: VulcanOpsState) -> list[dict[str, Any]]:
@@ -723,95 +896,36 @@ def _compute_explainability_score(evidence_chain: list[dict[str, Any]]) -> int:
     return min(int(raw * 100), 100)
 
 
-def _match_parts_to_lead_times(
-    parts_required: list[str],
-    root_cause: str | None = None,
-    failure_mode: str | None = None,
-) -> dict[str, int]:
-    """Map free-text parts to known lead-time categories (case-insensitive).
-
-    Searches both the strategy parts list and the diagnosis text so gaps are
-    detected even when the parts list contains only a generic placeholder.
-    """
-    matched: dict[str, int] = {}
-    diagnosis_text = " ".join(filter(None, [root_cause, failure_mode])).lower()
-
-    for part in parts_required:
-        part_lower = part.lower()
-        for key, lead in _PROCUREMENT_LEAD_TIMES.items():
-            key_lower = key.lower()
-            if key_lower in part_lower or key_lower.replace(" ", "_") in part_lower:
-                matched[part] = lead
-                break
-
-    # Also scan root_cause / failure_mode for part keywords not already present
-    # in the parts list. This keeps the gap grounded in the diagnosis itself.
-    for key, lead in _PROCUREMENT_LEAD_TIMES.items():
-        key_lower = key.lower()
-        if key_lower in diagnosis_text or key_lower.replace(" ", "_") in diagnosis_text:
-            if key not in matched:
-                matched[key] = lead
-
-    return matched
-
-
 def _compute_procurement_gap(state: VulcanOpsState) -> dict[str, Any]:
-    """Detect parts whose lead time exceeds the predicted RUL.
+    """Build procurement gap summary from maintenance_strategy_agent's constraint_violations.
 
-    Returns a dict suitable for embedding in final_report_json.
+    The agent queries live inventory and populates constraint_violations and
+    procurement_strategy directly; this function surfaces those for final_report_json.
     """
-    rul_hours = state.rul_prediction.remaining_useful_life_hours if state.rul_prediction else None
-    parts_required = state.strategy.parts_required if state.strategy else []
-    root_cause = state.diagnosis.root_cause if state.diagnosis else None
-    failure_mode = state.diagnosis.failure_mode if state.diagnosis else None
+    violations = state.strategy.constraint_violations if state.strategy else []
+    strategy_text = state.strategy.procurement_strategy if state.strategy else None
 
-    result: dict[str, Any] = {
-        "procurement_gap": False,
-        "rul_days": None,
-        "at_risk_parts": [],
+    return {
+        "procurement_gap": len(violations) > 0,
+        "constraint_violations": violations,
+        "procurement_strategy": strategy_text,
     }
-
-    if rul_hours is None:
-        return result
-
-    rul_days = rul_hours / 24.0
-    result["rul_days"] = round(rul_days, 1)
-
-    matched = _match_parts_to_lead_times(parts_required, root_cause, failure_mode)
-    at_risk: list[dict[str, Any]] = []
-    for part, lead_days in matched.items():
-        if rul_days < lead_days:
-            at_risk.append({
-                "part": part,
-                "lead_time_days": lead_days,
-                "rul_days": round(rul_days, 1),
-                "gap_days": round(lead_days - rul_days, 1),
-            })
-
-    if at_risk:
-        result["procurement_gap"] = True
-        result["at_risk_parts"] = at_risk
-        first = at_risk[0]
-        result["recommended_action"] = (
-            f"Expedite {first['part']} procurement. "
-            f"Current lead time ({first['lead_time_days']} days) exceeds predicted remaining life ({first['rul_days']} days)."
-        )
-
-    return result
 
 
 # ── node: finalize — Invariants 4 & 5 ────────────────────────────────────────
 
 
 async def _finalize_node(state: VulcanOpsState) -> dict:
-    errors: list[dict[str, Any]] = list(state.errors)
+    # Only track errors this node itself generates — pre-existing state.errors are
+    # already accumulated via the `add` reducer and must not be re-emitted here.
+    new_errors: list[dict[str, Any]] = []
     start = now_utc()
 
     # Invariant 4: if sensor data was provided, diagnosis must not be empty
     if state.sensor_readings and (
         state.diagnosis is None or not state.diagnosis.root_cause
     ):
-        errors.append({
+        new_errors.append({
             "agent": "finalize",
             "errors": [
                 "Invariant 4: sensor readings exist but diagnosis produced no root_cause. "
@@ -822,8 +936,8 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
     # Invariant 5: final report cannot be built without a root cause
     if state.diagnosis is None or not state.diagnosis.root_cause:
         logger.warning(
-            "Invariant 5: finalize blocked — diagnosis=%r errors=%r",
-            state.diagnosis, errors,
+            "Invariant 5: finalize blocked — diagnosis=%r new_errors=%r",
+            state.diagnosis, new_errors,
         )
         trace = build_trace("finalize", start, now_utc(), "error")
 
@@ -878,8 +992,8 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
             ),
         )
         return {
-            "execution_trace": _append_trace(state, trace),
-            "errors": errors,
+            "execution_trace": [trace],
+            "errors": new_errors,
             "diagnosis": stub_diagnosis,
             "role_reports": stub_reports,
         }
@@ -945,8 +1059,10 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
 
         # Only overwrite the diagnosis if the LLM itself did not already ask for inspection
         if state.diagnosis and not is_llm_fallback:
-            state.diagnosis.root_cause = _SAFE_ROOT_CAUSE
-            state.diagnosis.failure_mode = "insufficient evidence"
+            pending["diagnosis"] = state.diagnosis.model_copy(update={
+                "root_cause": _SAFE_ROOT_CAUSE,
+                "failure_mode": "insufficient evidence",
+            })
 
         # Override strategy — recommended_action and priority
         if state.strategy:
@@ -1053,14 +1169,15 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
     eff_strategy = pending.get("strategy", state.strategy)
     eff_verification = pending.get("verification", state.verification)
 
+    eff_diagnosis = pending.get("diagnosis", state.diagnosis)
     now = datetime.now(timezone.utc)
     final_report: dict[str, Any] = {
         "report_id": str(uuid.uuid4()),
         "machine_id": str(state.active_machine_id),
         "generated_at": now.isoformat(),
-        "root_cause": state.diagnosis.root_cause,
-        "failure_mode": state.diagnosis.failure_mode,
-        "diagnosis_confidence": state.diagnosis.confidence,
+        "root_cause": eff_diagnosis.root_cause if eff_diagnosis else None,
+        "failure_mode": eff_diagnosis.failure_mode if eff_diagnosis else None,
+        "diagnosis_confidence": eff_diagnosis.confidence if eff_diagnosis else None,
         "risk_level": state.impact.risk_level.value if state.impact and state.impact.risk_level else None,
         "estimated_downtime_hours": state.impact.estimated_downtime_hours if state.impact else None,
         "estimated_cost_usd": state.impact.estimated_cost_usd if state.impact else None,
@@ -1073,7 +1190,9 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
             "supervisor": state.role_reports.supervisor is not None,
             "manager":    state.role_reports.manager is not None,
         },
-        "pipeline_errors": len(errors),
+        "verification_contradictions": state.verification_contradictions,
+        "verification_revision_count": state.verification_revision_count,
+        "pipeline_errors": len(state.errors) + len(new_errors),
         # Report-quality telemetry
         "evidence_score": _telemetry.get("evidence_score"),
         "history_score": _telemetry.get("history_score"),
@@ -1088,10 +1207,32 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
     }
 
     trace = build_trace("finalize", start, now_utc(), "success")
+
+    # Publish high-risk alert for supervisor + manager when risk is high/critical
+    _rl_value = final_report.get("risk_level")
+    if _rl_value in {"high", "critical"}:
+        try:
+            from app.services.alert_bus import get_alert_bus, make_high_risk_job_alert
+            _machine_name = (
+                state.machine_context.machine_name if state.machine_context else None
+            )
+            _batch_id = final_report.get("report_id")
+            _alert = make_high_risk_job_alert(
+                machine_id=str(state.active_machine_id),
+                machine_name=_machine_name,
+                risk_level=_rl_value,
+                root_cause=final_report.get("root_cause") or "unknown",
+                recommended_action=final_report.get("recommended_action") or "",
+                report_batch_id=_batch_id,
+            )
+            get_alert_bus().publish(_alert)
+        except Exception as _fe:
+            logger.warning("alert_bus publish (high_risk) failed: %s", _fe)
+
     return {
         "final_report": final_report,
-        "execution_trace": _append_trace(state, trace),
-        "errors": errors,
+        "execution_trace": [trace],
+        "errors": new_errors,
         **pending,   # strategy, verification, role_reports if uncertain
     }
 
@@ -1107,6 +1248,7 @@ def build_graph() -> Any:
     """
     graph = StateGraph(VulcanOpsState)
 
+    graph.add_node("supervisor_agent",              _trace_node("supervisor_agent", _supervisor_node))
     graph.add_node("anomaly_agent",                 _trace_node("anomaly_agent", _anomaly_node))
     graph.add_node("prognostics_agent",             _trace_node("prognostics_agent", _prognostics_node))
     graph.add_node("evidence_retrieval_agent",      _trace_node("evidence_retrieval_agent", _evidence_retrieval_node))
@@ -1118,17 +1260,40 @@ def build_graph() -> Any:
     graph.add_node("communication_agent",           _trace_node("communication_agent", _communication_node))
     graph.add_node("finalize_report",               _trace_node("finalize_report", _finalize_node))
 
-    graph.add_edge(START,                            "anomaly_agent")
-    graph.add_edge("anomaly_agent",                 "prognostics_agent")
-    graph.add_edge("prognostics_agent",             "evidence_retrieval_agent")
-    graph.add_edge("evidence_retrieval_agent",      "diagnosis_agent")
-    graph.add_edge("diagnosis_agent",               "evidence_verification_agent")
-    graph.add_edge("evidence_verification_agent",   "operational_impact_agent")
-    graph.add_edge("operational_impact_agent",      "maintenance_strategy_agent")
-    graph.add_edge("maintenance_strategy_agent",    "plant_priority_agent")
-    graph.add_edge("plant_priority_agent",          "communication_agent")
-    graph.add_edge("communication_agent",           "finalize_report")
-    graph.add_edge("finalize_report",               END)
+    graph.add_edge(START, "supervisor_agent")
+
+    # Supervisor fans out to first active analytical stage (or straight to
+    # communication if the plan skips all analytical stages).
+    graph.add_conditional_edges(
+        "supervisor_agent",
+        lambda s: _next_active_after(s, current="supervisor_agent"),
+        {n: n for n in _ANALYTICAL_ORDER + ["communication_agent"]},
+    )
+
+    # Each analytical stage fans forward to the next active stage.
+    # evidence_verification_agent is handled separately (back-edge to diagnosis_agent).
+    for _i, _node in enumerate(_ANALYTICAL_ORDER):
+        if _node == "evidence_verification_agent":
+            continue
+        _forward_targets = {n: n for n in _ANALYTICAL_ORDER[_i + 1:] + ["communication_agent"]}
+        graph.add_conditional_edges(
+            _node,
+            lambda s, _n=_node: _next_active_after(s, current=_n),
+            _forward_targets,
+        )
+
+    # evidence_verification_agent: either advances forward OR cycles back to diagnosis_agent.
+    _ev_idx = _ANALYTICAL_ORDER.index("evidence_verification_agent")
+    _ev_forward = {n: n for n in _ANALYTICAL_ORDER[_ev_idx + 1:] + ["communication_agent"]}
+    _ev_targets = {"diagnosis_agent": "diagnosis_agent", **_ev_forward}
+    graph.add_conditional_edges(
+        "evidence_verification_agent",
+        _route_after_verification,
+        _ev_targets,
+    )
+
+    graph.add_edge("communication_agent", "finalize_report")
+    graph.add_edge("finalize_report", END)
 
     return graph.compile()
 
