@@ -12,6 +12,7 @@ Every call emits a structured log entry with status, timing, and token usage.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -148,16 +149,17 @@ class LLMService:
         agent: str,
         system: str,
         user: str,
-        timeout: float | None = None,
+        timeout: float | None = 30.0,
     ) -> dict[str, Any]:
         """
         Call the model with JSON output format. Returns the parsed dict.
 
         Raises LLMTimeout, LLMEmpty, LLMJSONError, or LLMAPIError.
+        timeout defaults to 30s; pass None to use the client-level timeout.
         """
         t0 = time.monotonic()
         try:
-            response = await self._get_client().chat.completions.create(
+            coro = self._get_client().chat.completions.create(
                 model=settings.LLM_MODEL,
                 messages=[
                     {"role": "system", "content": system},
@@ -167,6 +169,11 @@ class LLMService:
                 temperature=0.1,
                 timeout=timeout,
             )
+            response = await (asyncio.wait_for(coro, timeout=timeout) if timeout else coro)
+        except asyncio.TimeoutError as exc:
+            duration_ms = (time.monotonic() - t0) * 1000
+            _log_llm_call(agent=agent, status="timeout", duration_ms=duration_ms, error=f"asyncio_timeout: {timeout}s")
+            raise LLMTimeout(f"LLM request timed out after {timeout}s") from exc
         except APITimeoutError as exc:
             duration_ms = (time.monotonic() - t0) * 1000
             _log_llm_call(
@@ -245,18 +252,19 @@ class LLMService:
         system: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-        timeout: float | None = None,
+        timeout: float | None = 30.0,
     ) -> ToolCallResult:
         """
         Native tool-calling. Returns either a tool_call or a final text response.
 
         Raises LLMTimeout, LLMEmpty, or LLMAPIError.
+        timeout defaults to 30s per call; pass 15.0 for ReAct loop iterations.
         """
         t0 = time.monotonic()
         full_messages = [{"role": "system", "content": system}, *messages]
 
         try:
-            response = await self._get_client().chat.completions.create(
+            coro = self._get_client().chat.completions.create(
                 model=settings.LLM_MODEL,
                 messages=full_messages,
                 tools=tools,
@@ -264,6 +272,11 @@ class LLMService:
                 temperature=0.1,
                 timeout=timeout,
             )
+            response = await (asyncio.wait_for(coro, timeout=timeout) if timeout else coro)
+        except asyncio.TimeoutError as exc:
+            duration_ms = (time.monotonic() - t0) * 1000
+            _log_llm_call(agent=agent, status="timeout", duration_ms=duration_ms, error=f"asyncio_timeout: {timeout}s")
+            raise LLMTimeout(f"LLM request timed out after {timeout}s") from exc
         except APITimeoutError as exc:
             duration_ms = (time.monotonic() - t0) * 1000
             _log_llm_call(
@@ -360,12 +373,12 @@ class LLMService:
         agent: str,
         system: str,
         user: str,
-        timeout: float | None = None,
+        timeout: float | None = 30.0,
     ) -> str:
         """Plain text completion. Returns the assistant's content string."""
         t0 = time.monotonic()
         try:
-            response = await self._get_client().chat.completions.create(
+            coro = self._get_client().chat.completions.create(
                 model=settings.LLM_MODEL,
                 messages=[
                     {"role": "system", "content": system},
@@ -374,6 +387,11 @@ class LLMService:
                 temperature=0.2,
                 timeout=timeout,
             )
+            response = await (asyncio.wait_for(coro, timeout=timeout) if timeout else coro)
+        except asyncio.TimeoutError as exc:
+            duration_ms = (time.monotonic() - t0) * 1000
+            _log_llm_call(agent=agent, status="timeout", duration_ms=duration_ms, error=f"asyncio_timeout: {timeout}s")
+            raise LLMTimeout(f"LLM request timed out after {timeout}s") from exc
         except APITimeoutError as exc:
             duration_ms = (time.monotonic() - t0) * 1000
             _log_llm_call(
@@ -441,15 +459,13 @@ class LLMService:
             "- supervisor: shift supervisor coordinating the response — operational impact, resource needs, timeline, escalation.\n"
             "- manager: plant management — business risk, cost exposure, compliance, strategic recommendation."
         )
-        try:
-            raw = await self.call_json(
-                agent="communication_agent",
-                system=system,
-                user=prompt,
-            )
-        except LLMError:
-            return {**_COMMUNICATION_FALLBACK, "_telemetry": {"fallback_used": True}}
-
+        # Let LLMError propagate — callers (communication_formatter.run) handle it
+        # and return a typed degraded AgentResult. Never swallow here.
+        raw = await self.call_json(
+            agent="communication_formatter",
+            system=system,
+            user=prompt,
+        )
         return {
             "engineer": _to_str(raw.get("engineer"), _COMMUNICATION_FALLBACK["engineer"]),
             "supervisor": _to_str(raw.get("supervisor"), _COMMUNICATION_FALLBACK["supervisor"]),
@@ -486,14 +502,11 @@ class LLMService:
             'Required schema: {"answer": "<string>"}'
         )
         prompt = f"Machine data:\n{machine_facts}\n\nOperator question: {question}"
-        try:
-            raw = await self.call_json(
-                agent="copilot",
-                system=system,
-                user=prompt,
-            )
-        except LLMError:
-            return ""
+        raw = await self.call_json(
+            agent="copilot",
+            system=system,
+            user=prompt,
+        )
         return _to_str(raw.get("answer"), "")
 
 

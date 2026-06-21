@@ -30,6 +30,15 @@ from app.services.llm_service import LLMError, llm_service
 from sqlalchemy import select
 
 _MAX_ITERATIONS = 4
+_REACT_TOOL_TIMEOUT = 15.0
+_TOOL_STR_CAP = 4000
+
+
+def _cap(text: str) -> str:
+    if len(text) > _TOOL_STR_CAP:
+        return text[:_TOOL_STR_CAP] + " [truncated]"
+    return text
+
 
 # ── priority matrix (kept deterministic — used as fallback for system prompt) ──
 
@@ -301,7 +310,7 @@ async def _check_spares_inventory(part_keyword: str) -> str:
             f"  {r.part_name} | cat={r.category} | qty={r.qty_on_hand}{stock_flag}{reorder_flag} "
             f"| lead={r.lead_time_days}d | {cost} | supplier={r.supplier or 'unknown'}"
         )
-    return "\n".join(lines)
+    return _cap("\n".join(lines))
 
 
 def _get_crew_availability(start_date: str, hours_needed: int) -> str:
@@ -353,7 +362,7 @@ async def _estimate_repair_cost(parts: list[str], labor_hours: int) -> str:
     ]
     if not_found:
         result_lines.append(f"Note: no price found for: {', '.join(not_found)}")
-    return "\n".join(result_lines)
+    return _cap("\n".join(result_lines))
 
 
 async def _check_dependent_machines(machine_id: str) -> str:
@@ -488,14 +497,14 @@ async def run(state: VulcanOpsState) -> AgentResult:
                 system=_SYSTEM_PROMPT,
                 messages=messages,
                 tools=_TOOLS,
+                timeout=_REACT_TOOL_TIMEOUT,
             )
         except LLMError as exc:
-            print(
-                f"[maintenance_strategy_agent] LLM unavailable ({type(exc).__name__}); "
-                "using deterministic fallback",
-                flush=True,
-            )
+            _llm_error_reason = f"LLM unavailable ({type(exc).__name__}): {exc}"
+            print(f"[maintenance_strategy_agent] {_llm_error_reason}; using deterministic fallback", flush=True)
             plan = _deterministic_fallback(state)
+            plan["_degraded"] = True
+            plan["_degraded_reason"] = _llm_error_reason
             break
 
         thought = result.content or "(no narration)"
@@ -504,12 +513,11 @@ async def run(state: VulcanOpsState) -> AgentResult:
         tool_call_id = result.tool_call_id or f"synthetic-{iteration}"
 
         if result.kind == "final" or not action:
-            print(
-                f"[maintenance_strategy_agent] iteration={iteration} final-text fallback; "
-                "using deterministic plan",
-                flush=True,
-            )
+            _reason = f"iteration={iteration}: model returned prose instead of tool call; deterministic fallback"
+            print(f"[maintenance_strategy_agent] {_reason}", flush=True)
             plan = _deterministic_fallback(state)
+            plan["_degraded"] = True
+            plan["_degraded_reason"] = _reason
             break
 
         if action == "propose_plan":
@@ -557,12 +565,14 @@ async def run(state: VulcanOpsState) -> AgentResult:
         })
 
     if plan is None:
-        print(
-            "[maintenance_strategy_agent] loop exhausted without propose_plan; "
-            "using deterministic fallback",
-            flush=True,
-        )
+        _exhausted_reason = "ReAct loop exhausted without propose_plan; using deterministic fallback"
+        print(f"[maintenance_strategy_agent] {_exhausted_reason}", flush=True)
         plan = _deterministic_fallback(state)
+        plan["_degraded"] = True
+        plan["_degraded_reason"] = _exhausted_reason
+
+    is_degraded = bool(plan.pop("_degraded", False))
+    degraded_reason: str | None = plan.pop("_degraded_reason", None) if is_degraded else None
 
     # Map priority string → enum, tolerating case differences
     raw_priority = plan.get("priority", "scheduled").lower()
@@ -572,7 +582,8 @@ async def run(state: VulcanOpsState) -> AgentResult:
         priority_enum = MaintenancePriority.SCHEDULED
 
     return AgentResult(
-        status="success",
+        status="degraded" if is_degraded else "success",
+        degraded_reason=degraded_reason,
         data={
             "immediate_action": plan.get("immediate_action", ""),
             "priority": priority_enum.value,

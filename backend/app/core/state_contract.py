@@ -120,6 +120,7 @@ class VulcanOpsState(BaseModel):
     # ── Stage 3: Historical evidence ──────────────────────────────────────────
     maintenance_history: list[MaintenanceRecordSchema] = Field(default_factory=list)
     retrieved_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    retrieval_query_history: list[str] = Field(default_factory=list)
 
     # ── Stage 4: Analysis ─────────────────────────────────────────────────────
     execution_plan: ExecutionPlan | None = None

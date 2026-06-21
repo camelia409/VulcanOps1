@@ -15,7 +15,7 @@ Returns
 -------
     state      : VulcanOpsState with anomaly, rul_prediction, retrieved_evidence,
                  impact, and priority populated.
-    risk_score : float 0-100 from plant_priority_agent.priority_score;
+    risk_score : float 0-100 from plant_priority_engine.priority_score;
                  higher = more urgent; used for risk ranking before deep analysis.
 """
 
@@ -28,11 +28,11 @@ from datetime import datetime
 from typing import Any
 
 from app.agents import (
-    anomaly_agent,
+    anomaly_engine,
     evidence_retrieval_agent,
-    operational_impact_agent,
-    plant_priority_agent,
-    prognostics_agent,
+    operational_impact_engine,
+    plant_priority_engine,
+    prognostics_engine,
 )
 from app.agents.base import AgentResult
 from app.core.enums import MaintenancePriority, RiskLevel
@@ -92,7 +92,7 @@ def run_fast_agents(state: VulcanOpsState) -> tuple[VulcanOpsState, float]:
     risk_score = 0.0
 
     # ── 1. Anomaly Detection ──────────────────────────────────────────────────
-    result, trace = _call(anomaly_agent, state)
+    result, trace = _call(anomaly_engine, state)
     traces.append(trace)
     if result.status == "success":
         d = result.data
@@ -107,11 +107,11 @@ def run_fast_agents(state: VulcanOpsState) -> tuple[VulcanOpsState, float]:
         )
         state = state.model_copy(update={"anomaly": anomaly, "execution_trace": traces, "errors": errors})
     else:
-        errors.append({"agent": "anomaly_agent", "errors": result.errors})
+        errors.append({"agent": "anomaly_engine", "errors": result.errors})
         state = state.model_copy(update={"execution_trace": traces, "errors": errors})
 
     # ── 2. Prognostics (RUL) ─────────────────────────────────────────────────
-    result, trace = _call(prognostics_agent, state)
+    result, trace = _call(prognostics_engine, state)
     traces.append(trace)
     if result.status == "success":
         d = result.data
@@ -122,7 +122,7 @@ def run_fast_agents(state: VulcanOpsState) -> tuple[VulcanOpsState, float]:
         )
         state = state.model_copy(update={"rul_prediction": rul, "execution_trace": traces, "errors": errors})
     else:
-        errors.append({"agent": "prognostics_agent", "errors": result.errors})
+        errors.append({"agent": "prognostics_engine", "errors": result.errors})
         state = state.model_copy(update={"execution_trace": traces, "errors": errors})
 
     # ── 3. Evidence Retrieval ─────────────────────────────────────────────────
@@ -139,7 +139,7 @@ def run_fast_agents(state: VulcanOpsState) -> tuple[VulcanOpsState, float]:
         state = state.model_copy(update={"execution_trace": traces, "errors": errors})
 
     # ── 4. Operational Impact ─────────────────────────────────────────────────
-    result, trace = _call(operational_impact_agent, state)
+    result, trace = _call(operational_impact_engine, state)
     traces.append(trace)
     if result.status == "success":
         d = result.data
@@ -153,11 +153,11 @@ def run_fast_agents(state: VulcanOpsState) -> tuple[VulcanOpsState, float]:
         )
         state = state.model_copy(update={"impact": impact, "execution_trace": traces, "errors": errors})
     else:
-        errors.append({"agent": "operational_impact_agent", "errors": result.errors})
+        errors.append({"agent": "operational_impact_engine", "errors": result.errors})
         state = state.model_copy(update={"execution_trace": traces, "errors": errors})
 
     # ── 5. Plant Priority (provides risk score) ───────────────────────────────
-    result, trace = _call(plant_priority_agent, state)
+    result, trace = _call(plant_priority_engine, state)
     traces.append(trace)
     if result.status == "success":
         d = result.data
@@ -165,7 +165,7 @@ def run_fast_agents(state: VulcanOpsState) -> tuple[VulcanOpsState, float]:
         risk_score = float(d.get("priority_score", 0.0))
         state = state.model_copy(update={"priority": priority, "execution_trace": traces, "errors": errors})
     else:
-        errors.append({"agent": "plant_priority_agent", "errors": result.errors})
+        errors.append({"agent": "plant_priority_engine", "errors": result.errors})
         state = state.model_copy(update={"execution_trace": traces, "errors": errors})
 
     return state, risk_score

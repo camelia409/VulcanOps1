@@ -25,6 +25,14 @@ from app.models.sensor_reading import SensorReading
 from app.services.llm_service import LLMError, llm_service
 
 _MAX_ITERATIONS = 3
+_REACT_TOOL_TIMEOUT = 15.0
+_TOOL_STR_CAP = 4000
+
+
+def _cap(text: str) -> str:
+    if len(text) > _TOOL_STR_CAP:
+        return text[:_TOOL_STR_CAP] + " [truncated]"
+    return text
 
 _TOOLS: list[dict[str, Any]] = [
     {
@@ -238,7 +246,7 @@ async def _search_contradicting_evidence(
             f"{ev.get('chunk','')[:300]}"
             for i, ev in enumerate(evidence[:top_k], 1)
         ]
-        return "\n".join(lines)
+        return _cap("\n".join(lines))
     except Exception as exc:
         return f"Evidence search failed: {exc}"
 
@@ -277,7 +285,7 @@ async def _find_similar_past_cases(
         if r.downtime_hours:
             parts.append(f"downtime={r.downtime_hours}h")
         lines.append(f"[{i}] {', '.join(parts)}")
-    return "\n".join(lines) + f"\n({len(rows)} matching records)"
+    return _cap("\n".join(lines) + f"\n({len(rows)} matching records)")
 
 
 async def _check_sensor_consistency(
@@ -324,7 +332,7 @@ async def _check_sensor_consistency(
         for r in rows[-5:]
         if getattr(r, sensor, None) is not None
     ]
-    return (
+    return _cap(
         f"{sensor} ({hours}h window): n={n}, min={min(values):.2f}, max={max(values):.2f}, "
         f"mean={mean_v:.2f}, stddev={stddev:.2f}\n"
         f"Trend: {trend}\n"
@@ -414,13 +422,11 @@ async def run(state: VulcanOpsState) -> AgentResult:
                 system=_SYSTEM_PROMPT,
                 messages=messages,
                 tools=_TOOLS,
+                timeout=_REACT_TOOL_TIMEOUT,
             )
         except LLMError as exc:
-            print(
-                f"[evidence_verification_agent] LLM unavailable ({type(exc).__name__}); "
-                "falling back to accept",
-                flush=True,
-            )
+            _degraded_reason = f"LLM unavailable ({type(exc).__name__}): {exc}"
+            print(f"[evidence_verification_agent] {_degraded_reason}", flush=True)
             conclusion = {
                 "verified": True,
                 "evidence_score": 0.0,
@@ -428,6 +434,8 @@ async def run(state: VulcanOpsState) -> AgentResult:
                 "combined_score": 0.0,
                 "contradictions": [],
                 "recommendation": "accept",
+                "_degraded": True,
+                "_degraded_reason": _degraded_reason,
             }
             break
 
@@ -540,8 +548,12 @@ async def run(state: VulcanOpsState) -> AgentResult:
         + (f"Contradictions: {'; '.join(contradictions)}" if contradictions else "No contradictions found.")
     )
 
+    is_degraded = bool(conclusion.get("_degraded", False))
+    degraded_reason: str | None = conclusion.get("_degraded_reason") if is_degraded else None
+
     return AgentResult(
-        status="success",
+        status="degraded" if is_degraded else "success",
+        degraded_reason=degraded_reason,
         data={
             "verified": verified,
             "evidence_score": evidence_score,

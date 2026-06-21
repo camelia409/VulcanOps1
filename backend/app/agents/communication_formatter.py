@@ -1,5 +1,5 @@
 """
-Communication Agent — LLM Agent #2.
+Communication Formatter — single-shot LLM report formatter.
 
 Calls llm_service.generate_role_reports() which routes to qwen/qwen3-4b via OpenRouter.
 Generates three role-specific natural-language summaries from the full state
@@ -18,7 +18,7 @@ from typing import Any
 
 from app.agents.base import AgentResult
 from app.core.state_contract import VulcanOpsState
-from app.services.llm_service import llm_service
+from app.services.llm_service import LLMError, llm_service
 
 
 def _safe(value: Any, fallback: str = "not available") -> str:
@@ -107,6 +107,22 @@ manager: plant management — business risk, cost exposure, compliance, strategi
 Return JSON only."""
 
 
+def _build_degraded_role_text(state: VulcanOpsState) -> str:
+    root_cause = state.diagnosis.root_cause if state.diagnosis else "unknown"
+    risk_level = (
+        state.impact.risk_level.value
+        if state.impact and state.impact.risk_level
+        else "unknown"
+    )
+    action = state.strategy.recommended_action if state.strategy else "manual inspection"
+    return (
+        f"[Communication formatter unavailable — raw fields] "
+        f"root_cause={root_cause}, "
+        f"risk_level={risk_level}, "
+        f"action={action}"
+    )
+
+
 async def run(state: VulcanOpsState) -> AgentResult:
     required = [
         ("machine_context", state.machine_context),
@@ -120,20 +136,33 @@ async def run(state: VulcanOpsState) -> AgentResult:
             status="error",
             data={},
             errors=[
-                f"communication_agent requires complete analysis state. "
+                f"communication_formatter requires complete analysis state. "
                 f"Missing: {', '.join(missing)}"
             ],
         )
 
-    result = await llm_service.generate_role_reports(_build_prompt(state))
-    telemetry = result.get("_telemetry", {})
-
-    return AgentResult(
-        status="success",
-        data={
-            "engineer_summary":   result["engineer"],
-            "supervisor_summary": result["supervisor"],
-            "manager_summary":    result["manager"],
-            "llm_telemetry":      telemetry,
-        },
-    )
+    try:
+        result = await llm_service.generate_role_reports(_build_prompt(state))
+        telemetry = result.get("_telemetry", {})
+        return AgentResult(
+            status="success",
+            data={
+                "engineer_summary":   result["engineer"],
+                "supervisor_summary": result["supervisor"],
+                "manager_summary":    result["manager"],
+                "llm_telemetry":      telemetry,
+            },
+        )
+    except LLMError as exc:
+        degraded_reason = f"LLMError ({type(exc).__name__}): {exc}"
+        degraded_text = _build_degraded_role_text(state)
+        return AgentResult(
+            status="degraded",
+            degraded_reason=degraded_reason,
+            data={
+                "engineer_summary":   degraded_text,
+                "supervisor_summary": degraded_text,
+                "manager_summary":    degraded_text,
+                "llm_telemetry":      {"fallback_used": True},
+            },
+        )

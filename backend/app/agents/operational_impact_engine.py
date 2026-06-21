@@ -1,5 +1,5 @@
 """
-Operational Impact Agent — deterministic cost and production risk assessment.
+Operational Impact Engine — deterministic cost and production risk assessment.
 
 No LLM.
 

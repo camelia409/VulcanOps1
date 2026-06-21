@@ -29,15 +29,15 @@ _JOB_LOG = logging.getLogger("vulcanops.pipeline")
 
 # Pipeline stage -> user-visible progress percent.
 _STAGE_PROGRESS = {
-    "anomaly_agent": 10,
-    "prognostics_agent": 20,
+    "anomaly_engine": 10,
+    "prognostics_engine": 20,
     "evidence_retrieval_agent": 30,
     "diagnosis_agent": 50,
     "evidence_verification_agent": 60,
-    "operational_impact_agent": 70,
+    "operational_impact_engine": 70,
     "maintenance_strategy_agent": 80,
-    "priority_engine": 90,
-    "communication_agent": 95,
+    "plant_priority_engine": 90,
+    "communication_formatter": 95,
     "finalize_report": 100,
 }
 

@@ -1,5 +1,5 @@
 """
-Plant Priority Agent — deterministic fleet priority scoring.
+Plant Priority Engine — deterministic fleet priority scoring.
 
 No LLM.
 
@@ -78,7 +78,7 @@ def run(state: VulcanOpsState) -> AgentResult:
         return AgentResult(
             status="error",
             data={},
-            errors=[f"plant_priority_agent requires: {', '.join(missing)}"],
+            errors=[f"plant_priority_engine requires: {', '.join(missing)}"],
         )
 
     criticality_val = state.machine_context.criticality.value

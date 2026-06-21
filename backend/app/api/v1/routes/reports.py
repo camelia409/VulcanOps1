@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db.session import get_db
+from app.models.deep_analysis_job import DeepAnalysisJob
 from app.models.ingestion_event import IngestionEvent
 from app.models.machine import Machine
 from app.models.report_batch import ReportBatch
@@ -176,14 +177,36 @@ async def get_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> 
 async def run_deep_analysis(
     machine_id: uuid.UUID,
     background_tasks: BackgroundTasks,
+    response: Response,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """
     Enqueue a full deep-analysis job for one machine and return immediately.
 
+    Idempotent: if a job for this machine is already queued or running, the
+    existing job_id is returned with X-Deep-Analyze-Reused: true instead of
+    creating a duplicate pipeline run.
+
     The actual multi-agent pipeline runs as a BackgroundTask. Use
     GET /reports/jobs/{job_id} to poll for status and progress.
     """
+    # R3 idempotency: return the in-flight job rather than spawning a duplicate.
+    inflight_result = await db.execute(
+        select(DeepAnalysisJob)
+        .where(DeepAnalysisJob.machine_id == machine_id)
+        .where(DeepAnalysisJob.status.in_(["queued", "running"]))
+        .order_by(DeepAnalysisJob.queued_at.desc())
+        .limit(1)
+    )
+    inflight = inflight_result.scalar_one_or_none()
+    if inflight is not None:
+        response.headers["X-Deep-Analyze-Reused"] = "true"
+        return {
+            "job_id": str(inflight.job_id),
+            "status": inflight.status,
+            "reused": True,
+        }
+
     # Find the most recent batch for this machine so we can reuse its event_id.
     existing_result = await db.execute(
         select(ReportBatch)
@@ -215,6 +238,7 @@ async def run_deep_analysis(
     return {
         "job_id": str(job.job_id),
         "status": "queued",
+        "reused": False,
     }
 
 

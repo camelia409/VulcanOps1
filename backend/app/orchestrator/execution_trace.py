@@ -8,7 +8,7 @@ Each agent execution is recorded as:
     "end_time":     str,     # ISO 8601 UTC
     "latency_ms":   float,
     "status":       str,     # "success" | "error" | "skipped" | "partial"
-    "llm_called":   bool,    # True only for diagnosis_agent and communication_agent
+    "llm_called":   bool,    # True only for diagnosis_agent, evidence_verification_agent, maintenance_strategy_agent, supervisor_planner, communication_formatter
     "cache_hit":    bool,    # True when the LLM call was served from in-process cache
 }
 
@@ -31,9 +31,10 @@ def build_trace(
     status: str,
     llm_called: bool = False,
     cache_hit: bool = False,
+    degraded_reason: str | None = None,
 ) -> dict:
     latency_ms = (end - start).total_seconds() * 1000
-    return {
+    entry: dict = {
         "agent_name": agent_name,
         "start_time": start.isoformat(),
         "end_time":   end.isoformat(),
@@ -42,6 +43,9 @@ def build_trace(
         "llm_called": llm_called,
         "cache_hit":  cache_hit,
     }
+    if degraded_reason is not None:
+        entry["degraded_reason"] = degraded_reason
+    return entry
 
 
 def skipped_trace(agent_name: str, reason: str) -> dict:

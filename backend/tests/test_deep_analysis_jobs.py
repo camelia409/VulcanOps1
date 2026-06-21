@@ -142,7 +142,7 @@ async def test_execute_job_success():
 
     async def _fake_run_pipeline(machine_id, db, *, progress_callback=None):
         if progress_callback:
-            await progress_callback("anomaly_agent")
+            await progress_callback("anomaly_engine")
             await progress_callback("finalize_report")
         return mock_state
 
@@ -274,7 +274,7 @@ async def test_get_job_endpoint_returns_progress():
     fake_job = _make_job(
         job_id=job_id,
         status="running",
-        current_stage="communication_agent",
+        current_stage="communication_formatter",
         progress_percent=95,
     )
 
@@ -286,7 +286,7 @@ async def test_get_job_endpoint_returns_progress():
 
     assert response["job_id"] == str(job_id)
     assert response["status"] == "running"
-    assert response["current_stage"] == "communication_agent"
+    assert response["current_stage"] == "communication_formatter"
     assert response["progress_percent"] == 95
 
 
@@ -339,7 +339,7 @@ async def test_run_pipeline_progress_callback_invoked():
 
         cb = _progress_callback_ctx.get()
         if cb:
-            await cb("anomaly_agent")
+            await cb("anomaly_engine")
             await cb("diagnosis_agent")
             await cb("finalize_report")
         return fake_state
@@ -366,4 +366,4 @@ async def test_run_pipeline_progress_callback_invoked():
                         str(uuid.uuid4()), db, progress_callback=_fake_progress
                     )
 
-    assert progress_stages == ["anomaly_agent", "diagnosis_agent", "finalize_report"]
+    assert progress_stages == ["anomaly_engine", "diagnosis_agent", "finalize_report"]

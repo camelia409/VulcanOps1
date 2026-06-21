@@ -61,16 +61,16 @@ _LOW_RUL_THRESHOLD_HOURS = 48.0        # hours remaining → low_rul alert
 from langgraph.graph import END, START, StateGraph
 
 from app.agents import (
-    anomaly_agent,
-    communication_agent,
+    anomaly_engine,
+    communication_formatter,
     diagnosis_agent,
     evidence_retrieval_agent,
     evidence_verification_agent,
     maintenance_strategy_agent,
-    operational_impact_agent,
-    plant_priority_agent,
-    prognostics_agent,
-    supervisor_agent,
+    operational_impact_engine,
+    plant_priority_engine,
+    prognostics_engine,
+    supervisor_planner,
 )
 from app.agents.base import AgentResult
 from app.core.enums import MaintenancePriority, RiskLevel
@@ -157,14 +157,16 @@ async def _supervisor_node(state: VulcanOpsState) -> dict:
     """First node: decide which agents to run."""
     start = now_utc()
     try:
-        result: AgentResult = await supervisor_agent.run(state)
+        result: AgentResult = await supervisor_planner.run(state)
     except Exception as exc:
-        logger.exception("supervisor_agent raised unexpectedly: %s", exc)
+        logger.exception("supervisor_planner raised unexpectedly: %s", exc)
         result = AgentResult(status="error", data={}, errors=[str(exc)])
     end = now_utc()
 
-    trace = build_trace("supervisor_agent", start, end, result.status,
-                        llm_called=True)
+    trace = build_trace("supervisor_planner", start, end, result.status,
+                        llm_called=True, degraded_reason=result.degraded_reason)
+    if result.status == "degraded":
+        logger.warning("supervisor_planner degraded: %s", result.degraded_reason)
 
     if result.status == "error":
         # Fall back to the full pipeline so a supervisor failure never blocks analysis.
@@ -180,7 +182,7 @@ async def _supervisor_node(state: VulcanOpsState) -> dict:
         return {
             "execution_plan": fallback_plan,
             "execution_trace": [trace],
-            "errors": [{"agent": "supervisor_agent", "errors": result.errors}],
+            "errors": [{"agent": "supervisor_planner", "errors": result.errors}],
         }
 
     plan_data = result.data.get("execution_plan") or {}
@@ -199,21 +201,36 @@ async def _supervisor_node(state: VulcanOpsState) -> dict:
 # ── conditional routing ───────────────────────────────────────────────────────
 
 _ANALYTICAL_ORDER = [
-    "anomaly_agent",
-    "prognostics_agent",
+    "anomaly_engine",
+    "prognostics_engine",
     "evidence_retrieval_agent",
     "diagnosis_agent",
     "evidence_verification_agent",
-    "operational_impact_agent",
+    "operational_impact_engine",
     "maintenance_strategy_agent",
-    "plant_priority_agent",
+    "plant_priority_engine",
 ]
+
+# Maps LangGraph node name → ExecutionPlan stage key (used by supervisor_planner).
+# Stage keys ("anomaly", "prognostics", ...) are stable identifiers in the plan;
+# node names may use different suffixes (_engine, _agent, _formatter, _planner).
+_NODE_TO_STAGE_KEY: dict[str, str] = {
+    "anomaly_engine":               "anomaly",
+    "prognostics_engine":           "prognostics",
+    "evidence_retrieval_agent":     "evidence_retrieval",
+    "diagnosis_agent":              "diagnosis",
+    "evidence_verification_agent":  "evidence_verification",
+    "operational_impact_engine":    "operational_impact",
+    "maintenance_strategy_agent":   "maintenance_strategy",
+    "plant_priority_engine":        "plant_priority",
+    "communication_formatter":      "communication",
+}
 
 
 def _next_active_after(state: VulcanOpsState, current: str) -> str:
     """Return the next enabled analytical stage after `current`.
 
-    Falls through to 'communication_agent' when no more analytical stages remain.
+    Falls through to 'communication_formatter' when no more analytical stages remain.
     Skips nodes whose invariant preconditions cannot be satisfied even if the
     supervisor plan includes them (belt-and-suspenders).
     """
@@ -226,7 +243,7 @@ def _next_active_after(state: VulcanOpsState, current: str) -> str:
         start_idx = 0
 
     for node_name in _ANALYTICAL_ORDER[start_idx:]:
-        stage_key = node_name.replace("_agent", "")
+        stage_key = _NODE_TO_STAGE_KEY.get(node_name, node_name)
         if stage_key not in plan_stages:
             continue
         if node_name == "diagnosis_agent" and state.anomaly is None:
@@ -235,7 +252,7 @@ def _next_active_after(state: VulcanOpsState, current: str) -> str:
             continue
         return node_name
 
-    return "communication_agent"
+    return "communication_formatter"
 
 
 # ── verification cycle routing ────────────────────────────────────────────────
@@ -252,23 +269,26 @@ def _route_after_verification(state: VulcanOpsState) -> str:
     return _next_active_after(state, current="evidence_verification_agent")
 
 
+
+
+
 # ── node: anomaly ─────────────────────────────────────────────────────────────
 
 
 async def _anomaly_node(state: VulcanOpsState) -> dict:
     start = now_utc()
     try:
-        result: AgentResult = anomaly_agent.run(state)
+        result: AgentResult = anomaly_engine.run(state)
     except Exception as exc:
         result = AgentResult(status="error", data={}, errors=[str(exc)])
     end = now_utc()
 
-    trace = build_trace("anomaly_agent", start, end, result.status)
+    trace = build_trace("anomaly_engine", start, end, result.status)
 
     if result.status == "error":
         return {
             "execution_trace": [trace],
-            "errors": [{"agent": "anomaly_agent", "errors": result.errors}],
+            "errors": [{"agent": "anomaly_engine", "errors": result.errors}],
         }
 
     d = result.data
@@ -313,17 +333,17 @@ async def _anomaly_node(state: VulcanOpsState) -> dict:
 async def _prognostics_node(state: VulcanOpsState) -> dict:
     start = now_utc()
     try:
-        result: AgentResult = prognostics_agent.run(state)
+        result: AgentResult = prognostics_engine.run(state)
     except Exception as exc:
         result = AgentResult(status="error", data={}, errors=[str(exc)])
     end = now_utc()
 
-    trace = build_trace("prognostics_agent", start, end, result.status)
+    trace = build_trace("prognostics_engine", start, end, result.status)
 
     if result.status == "error":
         return {
             "execution_trace": [trace],
-            "errors": [{"agent": "prognostics_agent", "errors": result.errors}],
+            "errors": [{"agent": "prognostics_engine", "errors": result.errors}],
         }
 
     d = result.data
@@ -368,7 +388,24 @@ async def _evidence_retrieval_node(state: VulcanOpsState) -> dict:
         result = AgentResult(status="error", data={}, errors=[str(exc)])
     end = now_utc()
 
-    trace = build_trace("evidence_retrieval_agent", start, end, result.status)
+    d = result.data
+    telem: dict = d.get("llm_telemetry") or {}
+    fallback_used = bool(telem.get("fallback_used", False))
+    trace = build_trace(
+        "evidence_retrieval_agent", start, end, result.status,
+        llm_called=not fallback_used,
+    )
+
+    _PIPELINE_LOG.info(json.dumps({
+        "event":          "llm_call",
+        "agent":          "evidence_retrieval_agent",
+        "machine_id":     str(state.active_machine_id),
+        "iterations":     telem.get("iterations", 0),
+        "fallback_used":  fallback_used,
+        "queries":        d.get("query_history", []),
+        "chunks_found":   len(d.get("retrieved_evidence", [])),
+        "status":         result.status,
+    }))
 
     if result.status == "error":
         return {
@@ -377,7 +414,8 @@ async def _evidence_retrieval_node(state: VulcanOpsState) -> dict:
         }
 
     return {
-        "retrieved_evidence": result.data.get("retrieved_evidence", []),
+        "retrieved_evidence": d.get("retrieved_evidence", []),
+        "retrieval_query_history": d.get("query_history", []),
         "execution_trace": [trace],
     }
 
@@ -435,7 +473,8 @@ async def _diagnosis_node(state: VulcanOpsState) -> dict:
     telem: dict = d.get("llm_telemetry") or {}
     cache_hit = bool(telem.get("cache_hit", False))
     trace = build_trace("diagnosis_agent", start, end, result.status,
-                        llm_called=True, cache_hit=cache_hit)
+                        llm_called=True, cache_hit=cache_hit,
+                        degraded_reason=result.degraded_reason)
 
     _PIPELINE_LOG.info(json.dumps({
         "event":          "llm_call",
@@ -449,6 +488,9 @@ async def _diagnosis_node(state: VulcanOpsState) -> dict:
         "output_tokens":  telem.get("output_tokens", 0),
         "status":         result.status,
     }))
+
+    if result.status == "degraded":
+        logger.warning("diagnosis_agent degraded: %s", result.degraded_reason)
 
     if result.status == "error":
         return {
@@ -502,7 +544,8 @@ async def _evidence_verification_node(state: VulcanOpsState) -> dict:
     telem: dict = d.get("llm_telemetry") or {}
     cache_hit = bool(telem.get("cache_hit", False))
     trace = build_trace("evidence_verification_agent", start, end, result.status,
-                        llm_called=True, cache_hit=cache_hit)
+                        llm_called=True, cache_hit=cache_hit,
+                        degraded_reason=result.degraded_reason)
 
     _PIPELINE_LOG.info(json.dumps({
         "event":        "llm_call",
@@ -512,6 +555,9 @@ async def _evidence_verification_node(state: VulcanOpsState) -> dict:
         "iterations":   telem.get("iterations", 0),
         "status":       result.status,
     }))
+
+    if result.status == "degraded":
+        logger.warning("evidence_verification_agent degraded: %s", result.degraded_reason)
 
     if result.status == "error":
         return {
@@ -548,17 +594,17 @@ async def _evidence_verification_node(state: VulcanOpsState) -> dict:
 async def _operational_impact_node(state: VulcanOpsState) -> dict:
     start = now_utc()
     try:
-        result: AgentResult = operational_impact_agent.run(state)
+        result: AgentResult = operational_impact_engine.run(state)
     except Exception as exc:
         result = AgentResult(status="error", data={}, errors=[str(exc)])
     end = now_utc()
 
-    trace = build_trace("operational_impact_agent", start, end, result.status)
+    trace = build_trace("operational_impact_engine", start, end, result.status)
 
     if result.status == "error":
         return {
             "execution_trace": [trace],
-            "errors": [{"agent": "operational_impact_agent", "errors": result.errors}],
+            "errors": [{"agent": "operational_impact_engine", "errors": result.errors}],
         }
 
     d = result.data
@@ -587,7 +633,11 @@ async def _maintenance_strategy_node(state: VulcanOpsState) -> dict:
         result = AgentResult(status="error", data={}, errors=[str(exc)])
     end = now_utc()
 
-    trace = build_trace("maintenance_strategy_agent", start, end, result.status)
+    trace = build_trace("maintenance_strategy_agent", start, end, result.status,
+                        degraded_reason=result.degraded_reason)
+
+    if result.status == "degraded":
+        logger.warning("maintenance_strategy_agent degraded: %s", result.degraded_reason)
 
     if result.status == "error":
         return {
@@ -618,17 +668,17 @@ async def _maintenance_strategy_node(state: VulcanOpsState) -> dict:
 async def _plant_priority_node(state: VulcanOpsState) -> dict:
     start = now_utc()
     try:
-        result: AgentResult = plant_priority_agent.run(state)
+        result: AgentResult = plant_priority_engine.run(state)
     except Exception as exc:
         result = AgentResult(status="error", data={}, errors=[str(exc)])
     end = now_utc()
 
-    trace = build_trace("plant_priority_agent", start, end, result.status)
+    trace = build_trace("plant_priority_engine", start, end, result.status)
 
     if result.status == "error":
         return {
             "execution_trace": [trace],
-            "errors": [{"agent": "plant_priority_agent", "errors": result.errors}],
+            "errors": [{"agent": "plant_priority_engine", "errors": result.errors}],
         }
 
     d = result.data
@@ -653,28 +703,31 @@ async def _communication_node(state: VulcanOpsState) -> dict:
     if state.strategy is None:
         return {
             "execution_trace": [skipped_trace(
-                "communication_agent",
+                "communication_formatter",
                 "Invariant 3: state.strategy is None — cannot generate role reports without strategy",
             )],
         }
 
     start = now_utc()
     try:
-        result: AgentResult = await communication_agent.run(state)
+        result: AgentResult = await communication_formatter.run(state)
     except Exception as exc:
-        logger.exception("communication_agent raised unexpectedly: %s", exc)
+        logger.exception("communication_formatter raised unexpectedly: %s", exc)
         result = AgentResult(status="error", data={}, errors=[str(exc)])
     end = now_utc()
 
     d = result.data
     telem: dict = d.get("llm_telemetry") or {}
     cache_hit = bool(telem.get("cache_hit", False))
-    trace = build_trace("communication_agent", start, end, result.status,
-                        llm_called=True, cache_hit=cache_hit)
+    trace = build_trace("communication_formatter", start, end, result.status,
+                        llm_called=True, cache_hit=cache_hit,
+                        degraded_reason=result.degraded_reason)
+    if result.status == "degraded":
+        logger.warning("communication_formatter degraded: %s", result.degraded_reason)
 
     _PIPELINE_LOG.info(json.dumps({
         "event":          "llm_call",
-        "agent":          "communication_agent",
+        "agent":          "communication_formatter",
         "machine_id":     str(state.active_machine_id),
         "model":          telem.get("model", ""),
         "latency_ms":     telem.get("latency_ms", 0.0),
@@ -688,7 +741,7 @@ async def _communication_node(state: VulcanOpsState) -> dict:
     if result.status == "error":
         return {
             "execution_trace": [trace],
-            "errors": [{"agent": "communication_agent", "errors": result.errors}],
+            "errors": [{"agent": "communication_formatter", "errors": result.errors}],
         }
 
     now = datetime.now(timezone.utc)
@@ -991,11 +1044,14 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
                 compliance_flags=[],
             ),
         )
+        # Prefer role reports already produced by communication_formatter (e.g. degraded
+        # fallback text) over the generic stub — only use stub if none exist yet.
+        final_role_reports = state.role_reports if state.role_reports is not None else stub_reports
         return {
             "execution_trace": [trace],
             "errors": new_errors,
             "diagnosis": stub_diagnosis,
-            "role_reports": stub_reports,
+            "role_reports": final_role_reports,
         }
 
     # ── EVIDENCE- AND CONFIDENCE-AWARE FINALIZATION ───────────────────────────
@@ -1123,13 +1179,19 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
                 ),
             )
         else:
-            rr.engineer.safety_notes = (
-                "Evidence is insufficient to determine root cause. "
-                "Perform manual inspection before repair actions."
+            # Preserve degraded communication_formatter output — it already contains
+            # structured raw-field info that is more useful than the generic stub.
+            _comm_degraded = (rr.engineer.safety_notes or "").startswith(
+                "[Communication formatter unavailable"
             )
+            if not _comm_degraded:
+                rr.engineer.safety_notes = (
+                    "Evidence is insufficient to determine root cause. "
+                    "Perform manual inspection before repair actions."
+                )
             rr.engineer.recommended_action = "Manual inspection before repair."
             rr.engineer.priority = MaintenancePriority.URGENT
-            if rr.supervisor:
+            if rr.supervisor and not _comm_degraded:
                 rr.supervisor.resource_requirements = _sanitize_uncertain_text(
                     "Verification: Pending. "
                     "Escalate for manual inspection. Do not allocate major repair "
@@ -1137,7 +1199,7 @@ async def _finalize_node(state: VulcanOpsState) -> dict:
                 )
                 rr.supervisor.recommended_action = _SAFE_ACTION
                 rr.supervisor.priority = MaintenancePriority.URGENT
-            if rr.manager:
+            if rr.manager and not _comm_degraded:
                 rr.manager.business_impact = _sanitize_uncertain_text(
                     "Verification: Preliminary assessment only. "
                     "Business impact estimates are provisional until inspection "
@@ -1248,26 +1310,26 @@ def build_graph() -> Any:
     """
     graph = StateGraph(VulcanOpsState)
 
-    graph.add_node("supervisor_agent",              _trace_node("supervisor_agent", _supervisor_node))
-    graph.add_node("anomaly_agent",                 _trace_node("anomaly_agent", _anomaly_node))
-    graph.add_node("prognostics_agent",             _trace_node("prognostics_agent", _prognostics_node))
+    graph.add_node("supervisor_planner",            _trace_node("supervisor_planner", _supervisor_node))
+    graph.add_node("anomaly_engine",                _trace_node("anomaly_engine", _anomaly_node))
+    graph.add_node("prognostics_engine",            _trace_node("prognostics_engine", _prognostics_node))
     graph.add_node("evidence_retrieval_agent",      _trace_node("evidence_retrieval_agent", _evidence_retrieval_node))
     graph.add_node("diagnosis_agent",               _trace_node("diagnosis_agent", _diagnosis_node))
     graph.add_node("evidence_verification_agent",   _trace_node("evidence_verification_agent", _evidence_verification_node))
-    graph.add_node("operational_impact_agent",      _trace_node("operational_impact_agent", _operational_impact_node))
+    graph.add_node("operational_impact_engine",     _trace_node("operational_impact_engine", _operational_impact_node))
     graph.add_node("maintenance_strategy_agent",    _trace_node("maintenance_strategy_agent", _maintenance_strategy_node))
-    graph.add_node("plant_priority_agent",          _trace_node("priority_engine", _plant_priority_node))
-    graph.add_node("communication_agent",           _trace_node("communication_agent", _communication_node))
+    graph.add_node("plant_priority_engine",         _trace_node("plant_priority_engine", _plant_priority_node))
+    graph.add_node("communication_formatter",       _trace_node("communication_formatter", _communication_node))
     graph.add_node("finalize_report",               _trace_node("finalize_report", _finalize_node))
 
-    graph.add_edge(START, "supervisor_agent")
+    graph.add_edge(START, "supervisor_planner")
 
     # Supervisor fans out to first active analytical stage (or straight to
-    # communication if the plan skips all analytical stages).
+    # communication_formatter if the plan skips all analytical stages).
     graph.add_conditional_edges(
-        "supervisor_agent",
-        lambda s: _next_active_after(s, current="supervisor_agent"),
-        {n: n for n in _ANALYTICAL_ORDER + ["communication_agent"]},
+        "supervisor_planner",
+        lambda s: _next_active_after(s, current="supervisor_planner"),
+        {n: n for n in _ANALYTICAL_ORDER + ["communication_formatter"]},
     )
 
     # Each analytical stage fans forward to the next active stage.
@@ -1275,7 +1337,7 @@ def build_graph() -> Any:
     for _i, _node in enumerate(_ANALYTICAL_ORDER):
         if _node == "evidence_verification_agent":
             continue
-        _forward_targets = {n: n for n in _ANALYTICAL_ORDER[_i + 1:] + ["communication_agent"]}
+        _forward_targets = {n: n for n in _ANALYTICAL_ORDER[_i + 1:] + ["communication_formatter"]}
         graph.add_conditional_edges(
             _node,
             lambda s, _n=_node: _next_active_after(s, current=_n),
@@ -1284,7 +1346,7 @@ def build_graph() -> Any:
 
     # evidence_verification_agent: either advances forward OR cycles back to diagnosis_agent.
     _ev_idx = _ANALYTICAL_ORDER.index("evidence_verification_agent")
-    _ev_forward = {n: n for n in _ANALYTICAL_ORDER[_ev_idx + 1:] + ["communication_agent"]}
+    _ev_forward = {n: n for n in _ANALYTICAL_ORDER[_ev_idx + 1:] + ["communication_formatter"]}
     _ev_targets = {"diagnosis_agent": "diagnosis_agent", **_ev_forward}
     graph.add_conditional_edges(
         "evidence_verification_agent",
@@ -1292,7 +1354,7 @@ def build_graph() -> Any:
         _ev_targets,
     )
 
-    graph.add_edge("communication_agent", "finalize_report")
+    graph.add_edge("communication_formatter", "finalize_report")
     graph.add_edge("finalize_report", END)
 
     return graph.compile()

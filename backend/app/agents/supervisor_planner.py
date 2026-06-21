@@ -1,5 +1,5 @@
 """
-Supervisor Agent — cheap, single-shot LLM planner with a deterministic baseline.
+Supervisor Planner — cheap, single-shot LLM planner with a deterministic baseline.
 
 Inspects the initial machine state and decides which downstream agents to run.
 This avoids burning budget on agents that cannot contribute (e.g. evidence
@@ -210,7 +210,7 @@ def _build_heuristic_plan(state: VulcanOpsState, document_chunks: int) -> Execut
     )
 
 
-def _enforce_hard_rules(plan: ExecutionPlan, state: VulcanOpsState) -> ExecutionPlan:
+def _enforce_hard_rules(plan: ExecutionPlan, state: VulcanOpsState, document_chunks: int = 0) -> ExecutionPlan:
     """Defensive re-check of the hard rules; mutates and returns the plan."""
     stages_set = set(plan.stages)
     skipped = dict(plan.skipped)
@@ -238,7 +238,20 @@ def _enforce_hard_rules(plan: ExecutionPlan, state: VulcanOpsState) -> Execution
         plan.stages.append("communication")
         skipped.pop("communication", None)
 
-    # Rule 5: evidence_verification must run when diagnosis is planned AND
+    # Rule 5a: evidence_retrieval must run when document_chunks > 0.
+    # The LLM frequently hallucinates document_chunks=0 and drops this stage
+    # even when documents are present. The heuristic already made the correct
+    # decision — protect it here the same way evidence_verification is protected.
+    if document_chunks > 0 and "evidence_retrieval" not in stages_set:
+        try:
+            anomaly_idx = plan.stages.index("anomaly")
+            plan.stages.insert(anomaly_idx + 1, "evidence_retrieval")
+        except ValueError:
+            plan.stages.insert(0, "evidence_retrieval")
+        stages_set.add("evidence_retrieval")
+        skipped.pop("evidence_retrieval", None)
+
+    # Rule 5b: evidence_verification must run when diagnosis is planned AND
     # maintenance history exists (enough evidence to challenge the diagnosis).
     # The LLM tends to drop this stage alongside evidence_retrieval; protect it
     # because it is now the adversarial ReAct agent and central to agentic value.
@@ -267,9 +280,10 @@ async def run(state: VulcanOpsState) -> AgentResult:
         f"{heuristic_plan.model_dump_json()}"
     )
 
+    degraded_reason: str | None = None
     try:
         plan = await llm_service.call_structured(
-            agent="supervisor_agent",
+            agent="supervisor_planner",
             system=_SUPERVISOR_SYSTEM_PROMPT,
             user=user_prompt,
             schema=ExecutionPlan,
@@ -277,22 +291,29 @@ async def run(state: VulcanOpsState) -> AgentResult:
         # Sanitize: drop any stage names the LLM invented outside _AVAILABLE_STAGES.
         plan.stages = [s for s in plan.stages if s in _AVAILABLE_STAGES]
         if not plan.stages:
+            degraded_reason = "LLM returned empty stage list after sanitization; using heuristic plan"
+            print(f"[supervisor_planner] {degraded_reason}", flush=True)
             plan = heuristic_plan
-    except (LLMError, ValidationError) as exc:
-        # Heuristic fallback: safe, deterministic, and already respects hard rules.
-        print(f"[supervisor_agent] LLM plan failed ({type(exc).__name__}); using heuristic plan.", flush=True)
+    except LLMError as exc:
+        degraded_reason = f"LLMError ({type(exc).__name__}): {exc}; using heuristic plan"
+        print(f"[supervisor_planner] {degraded_reason}", flush=True)
+        plan = heuristic_plan
+    except ValidationError as exc:
+        degraded_reason = f"LLM returned invalid plan schema ({type(exc).__name__}); using heuristic plan"
+        print(f"[supervisor_planner] {degraded_reason}", flush=True)
         plan = heuristic_plan
 
-    plan = _enforce_hard_rules(plan, state)
+    plan = _enforce_hard_rules(plan, state, document_chunks=document_chunks)
 
     print(
-        f"[supervisor_agent] plan={plan.stages} skipped={list(plan.skipped.keys())} "
+        f"[supervisor_planner] plan={plan.stages} skipped={list(plan.skipped.keys())} "
         f"rationale={plan.rationale[:120]!r}",
         flush=True,
     )
 
     return AgentResult(
-        status="success",
+        status="degraded" if degraded_reason else "success",
+        degraded_reason=degraded_reason,
         data={
             "execution_plan": plan.model_dump(),
             "llm_telemetry": {},

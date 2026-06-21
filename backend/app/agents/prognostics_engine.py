@@ -1,5 +1,5 @@
 """
-Prognostics Agent — deterministic Remaining Useful Life (RUL) estimation.
+Prognostics Engine — deterministic Remaining Useful Life (RUL) estimation.
 
 Input  : state.sensor_readings, state.maintenance_history
 Output : AgentResult.data = {

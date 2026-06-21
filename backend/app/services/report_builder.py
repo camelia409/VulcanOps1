@@ -158,6 +158,14 @@ def build_single_report(state: VulcanOpsState) -> dict[str, Any]:
         "verification_contradictions":  telemetry.get("verification_contradictions", []),
         "verification_revision_count":  telemetry.get("verification_revision_count", 0),
         "verification_recommendation":  state.verification_recommendation,
+        # Evidence retrieval query history (shows multi-hop search attempts)
+        "retrieval_query_history": state.retrieval_query_history,
+        # R1: surfaces every agent that ran in degraded mode (LLM unavailable / fallback fired)
+        "pipeline_degradations": [
+            f"{e['agent_name']}: {e.get('degraded_reason', 'degraded fallback fired')}"
+            for e in (state.execution_trace or [])
+            if e.get("status") == "degraded"
+        ],
     }
 
 

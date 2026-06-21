@@ -25,6 +25,7 @@ import statistics
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import select, text
 
 from app.agents import evidence_retrieval_agent
@@ -41,6 +42,57 @@ from app.models.sensor_reading import SensorReading
 from app.services.llm_service import LLMError, llm_service
 
 _MAX_ITERATIONS = 4
+_REACT_TOOL_TIMEOUT = 15.0   # per LLM call in the ReAct loop
+_TOOL_STR_CAP = 4000         # max chars returned by any tool to the LLM
+
+
+# ── R2: Pydantic schemas for tool outputs ─────────────────────────────────────
+
+class _EvidenceChunk(BaseModel):
+    source: str = "unknown"
+    relevance_score: float = 0.0
+    chunk: str = ""
+    source_type: str = "document"
+
+
+class _RetrieveMoreOut(BaseModel):
+    chunks: list[_EvidenceChunk]
+    count: int
+
+
+class _MaintenanceRecord(BaseModel):
+    date: str = "unknown"
+    failure_mode: str = ""
+    action_taken: str = ""
+    downtime_hours: float | None = None
+
+
+class _MaintenanceSearchOut(BaseModel):
+    records: list[_MaintenanceRecord]
+    match_count: int
+
+
+class _SensorStats(BaseModel):
+    count: int
+    min: float
+    max: float
+    mean: float
+    stddev: float = 0.0
+
+
+class _SensorHistoryOut(BaseModel):
+    sensor: str
+    window_hours: int
+    stats: _SensorStats
+    last_readings: list[str]
+
+
+def _cap(text: str) -> str:
+    """Truncate tool string output so it never floods the LLM context."""
+    if len(text) > _TOOL_STR_CAP:
+        return text[:_TOOL_STR_CAP] + " [truncated]"
+    return text
+
 
 _TOOLS: list[dict[str, Any]] = [
     {
@@ -379,8 +431,17 @@ async def _retrieve_more(query: str, state: VulcanOpsState) -> str:
         deep=True,
     )
     result = await evidence_retrieval_agent.run(synthetic_state)
-    evidence = result.data.get("retrieved_evidence", [])
-    return _format_evidence(evidence[:3])
+    raw_evidence = result.data.get("retrieved_evidence", [])
+    # R2: validate each chunk against schema before sending to LLM
+    try:
+        validated = _RetrieveMoreOut(
+            chunks=[_EvidenceChunk.model_validate(ev) for ev in raw_evidence[:3]],
+            count=len(raw_evidence),
+        )
+        evidence = [c.model_dump() for c in validated.chunks]
+    except ValidationError:
+        evidence = raw_evidence[:3]
+    return _cap(_format_evidence(evidence))
 
 
 async def _get_sensor_history(sensor: str, hours: int, state: VulcanOpsState) -> str:
@@ -404,25 +465,34 @@ async def _get_sensor_history(sensor: str, hours: int, state: VulcanOpsState) ->
     if not values:
         return f"Sensor '{sensor}' has no data in the last {hours}h."
 
-    stats = {
-        "count": len(values),
-        "min": round(min(values), 2),
-        "max": round(max(values), 2),
-        "mean": round(sum(values) / len(values), 2),
-    }
-    if len(values) > 1:
-        stats["stddev"] = round(statistics.stdev(values), 2)
-
     last_5 = [
         f"{r.timestamp.isoformat()}: {getattr(r, sensor)}"
         for r in rows[:5]
         if getattr(r, sensor, None) is not None
     ]
 
-    return (
-        f"{sensor} history (last {hours}h): {json.dumps(stats)}. "
-        f"Last 5 readings: {' | '.join(last_5)}"
-    )
+    # R2: validate stats through schema before sending to LLM
+    try:
+        out = _SensorHistoryOut(
+            sensor=sensor,
+            window_hours=hours,
+            stats=_SensorStats(
+                count=len(values),
+                min=round(min(values), 2),
+                max=round(max(values), 2),
+                mean=round(sum(values) / len(values), 2),
+                stddev=round(statistics.stdev(values), 2) if len(values) > 1 else 0.0,
+            ),
+            last_readings=last_5,
+        )
+        text_out = (
+            f"{out.sensor} history (last {out.window_hours}h): {out.stats.model_dump_json()}. "
+            f"Last readings: {' | '.join(out.last_readings)}"
+        )
+    except ValidationError:
+        text_out = f"{sensor} history (last {hours}h): {len(values)} values. Last: {' | '.join(last_5)}"
+
+    return _cap(text_out)
 
 
 async def _search_maintenance(failure_mode: str, state: VulcanOpsState) -> str:
@@ -446,17 +516,38 @@ async def _search_maintenance(failure_mode: str, state: VulcanOpsState) -> str:
     if not rows:
         return f"No maintenance records matching '{failure_mode}' for this machine."
 
-    lines = []
-    for i, r in enumerate(rows, 1):
-        parts = [f"date={r.date.isoformat() if r.date else 'unknown'}"]
-        if r.failure_mode:
-            parts.append(f"failure_mode={r.failure_mode}")
-        if r.action_taken:
-            parts.append(f"action={r.action_taken}")
-        if r.downtime_hours:
-            parts.append(f"downtime={r.downtime_hours}h")
-        lines.append(f"[{i}] {', '.join(parts)}")
-    return "\n".join(lines)
+    # R2: validate records through schema before sending to LLM
+    try:
+        validated = _MaintenanceSearchOut(
+            records=[
+                _MaintenanceRecord(
+                    date=r.date.isoformat() if r.date else "unknown",
+                    failure_mode=r.failure_mode or "",
+                    action_taken=r.action_taken or "",
+                    downtime_hours=r.downtime_hours,
+                )
+                for r in rows
+            ],
+            match_count=len(rows),
+        )
+        lines = [
+            f"[{i}] date={rec.date}, failure_mode={rec.failure_mode}, "
+            f"action={rec.action_taken}"
+            + (f", downtime={rec.downtime_hours}h" if rec.downtime_hours else "")
+            for i, rec in enumerate(validated.records, 1)
+        ]
+    except ValidationError:
+        lines = []
+        for i, r in enumerate(rows, 1):
+            parts = [f"date={r.date.isoformat() if r.date else 'unknown'}"]
+            if r.failure_mode:
+                parts.append(f"failure_mode={r.failure_mode}")
+            if r.action_taken:
+                parts.append(f"action={r.action_taken}")
+            if r.downtime_hours:
+                parts.append(f"downtime={r.downtime_hours}h")
+            lines.append(f"[{i}] {', '.join(parts)}")
+    return _cap("\n".join(lines))
 
 
 async def _execute_tool(
@@ -513,12 +604,11 @@ def _fallback_result(error: LLMError) -> AgentResult:
         supporting_evidence=[],
         reasoning_trace=trace,
     )
-    print(
-        f"[diagnosis_agent] LLM unavailable, deterministic fallback ({type(error).__name__})",
-        flush=True,
-    )
+    reason = f"LLM unavailable ({type(error).__name__}): {error}"
+    print(f"[diagnosis_agent] {reason}", flush=True)
     return AgentResult(
-        status="success",
+        status="degraded",
+        degraded_reason=reason,
         data={
             "root_cause": diagnosis.root_cause,
             "failure_mode": diagnosis.failure_mode,
@@ -573,6 +663,7 @@ async def run(state: VulcanOpsState) -> AgentResult:
                 system=_REACT_SYSTEM_PROMPT,
                 messages=messages,
                 tools=_TOOLS,
+                timeout=_REACT_TOOL_TIMEOUT,
             )
         except LLMError as exc:
             return _fallback_result(exc)

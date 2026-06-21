@@ -1,5 +1,5 @@
 """
-Anomaly Agent — deterministic threshold-based anomaly detection.
+Anomaly Engine — deterministic threshold-based anomaly detection.
 
 Input  : state.sensor_readings
 Output : AgentResult.data = {
